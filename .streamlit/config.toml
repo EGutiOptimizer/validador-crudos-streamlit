@@ -1,0 +1,7 @@
+# .streamlit/config.toml
+[theme]
+primaryColor="#0A66C2"         # color principal (botones, radios, checkboxes)
+backgroundColor="#FFFFFF"      # fondo
+secondaryBackgroundColor="#F5F7FB"
+textColor="#222222"
+font="sans serif"
