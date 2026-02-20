@@ -62,7 +62,7 @@ El petróleo crudo se caracteriza mediante **destilación fraccionada**: se cali
 Ejemplos de cortes:
 - `150-200` → fracción que destila entre 150 °C y 200 °C
 - `300+` → fracción que destila por encima de 300 °C (corte "pesado")
-- `C6-C10` → fracción de hidrocarburos de 6 a 10 carbonos
+- `C6-C10` → cortes 6 al 10
 
 ### Propiedades
 
@@ -950,3 +950,4 @@ derecho de uso, reproducción ni derivación.
 ---
 
 *Documentación generada para la versión mejorada del proyecto. Última actualización: feb 2026.*
+
