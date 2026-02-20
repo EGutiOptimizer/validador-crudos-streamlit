@@ -1,720 +1,579 @@
-# core/validator_core.py
-# -*- coding: utf-8 -*-
+"""
+validator_core.py
+=================
+Lógica de negocio pura para validación de crudos RAMS vs ISA.
+
+Sin dependencias de Streamlit — 100% testeable en aislamiento.
+Todas las funciones reciben y devuelven tipos estándar (str, float, DataFrame).
+"""
+from __future__ import annotations
+
 import io
 import logging
-import os
 import re
 import unicodedata
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import IO
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import PatternFill, Font
-from openpyxl.formatting.rule import Rule
-from openpyxl.styles.differential import DifferentialStyle
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-# ===========
-# Logging
-# ===========
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s"
-    )
+from core.models import ValidationResult, ThresholdConfig
 
-# ===========
-# Utilidades de normalización
-# ===========
-def strip_accents(text: str) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', text)
-        if unicodedata.category(c) != 'Mn'
-    )
+logger = logging.getLogger(__name__)
 
-def canon_prop(s: str, alias: Optional[Dict[str, str]] = None) -> str:
-    if s is None:
-        return ""
-    t = strip_accents(str(s)).upper().strip()
-    for ch in ['.', 'º', '°']:
-        t = t.replace(ch, '')
-    t = re.sub(r"\s+", " ", t)
-    if not re.search(r"[A-Z0-9]", t):
-        return ""
-    if alias:
-        return alias.get(t, t)
-    return t
+# ---------------------------------------------------------------------------
+# Constantes
+# ---------------------------------------------------------------------------
 
-def canon_corte(s: str) -> str:
-    if s is None:
-        return ""
-    t = str(s)
-    t = t.replace('\u00A0', ' ')
-    t = ''.join(' ' if unicodedata.category(c) == 'Zs' else c for c in t)
-    for dash in ['\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212']:
-        t = t.replace(dash, '-')
-    t = t.replace('º', '').replace('°', '')
-    t = re.sub(r"\s*-\s*", "-", t)
-    t = re.sub(r"\s+", "", t).upper()
-    return t
+SEMAFORO_COLORS = {
+    "verde": "FF92D050",      # verde Excel
+    "amarillo": "FFFFEB9C",   # amarillo Excel
+    "rojo": "FFFF0000",       # rojo Excel
+}
 
-# ===========
-# Detección/umbrales
-# ===========
-def detectar_columna_tipo(df: pd.DataFrame) -> Optional[str]:
-    for col in df.columns:
-        name = str(col).strip().lower()
-        if name in {"tipo", "columna1", "categoria", "categoría"}:
-            return col
-    sample_cols = [c for c in df.columns if str(c).strip().lower() not in {"propiedad", "unidad"}]
-    for col in sample_cols:
+SEMAFORO_LABELS = {
+    "verde": "🟢 OK",
+    "amarillo": "🟡 Revisar",
+    "rojo": "🔴 Fuera de rango",
+}
+
+SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+
+
+# ---------------------------------------------------------------------------
+# 1. Canonización de nombres
+# ---------------------------------------------------------------------------
+
+def canonize_name(name: str) -> str:
+    """Normaliza el nombre de un archivo para emparejamiento ISA↔RAMS tolerante.
+
+    Elimina extensión, prefijos/sufijos ISA/RAMS, acentos, espacios
+    y caracteres no alfanuméricos. Convierte a minúsculas.
+
+    Args:
+        name: Nombre de archivo original (con o sin extensión).
+
+    Returns:
+        Cadena normalizada para comparación.
+
+    Examples:
+        >>> canonize_name("ISA_Crudo_Maya.xlsx")
+        'crudomaya'
+        >>> canonize_name("RAMS-Crudo_Maya.xlsx")
+        'crudomaya'
+        >>> canonize_name("Crudo Máya_ISA.xlsx")
+        'crudomaya'
+    """
+    # 1. Eliminar extensión
+    name = re.sub(r"\.[^.]+$", "", name)
+    # 2. Normalizar Unicode → eliminar acentos
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    # 3. Eliminar prefijos ISA/RAMS (inicio)
+    name = re.sub(r"^(isa|rams)[_\-\s]*", "", name, flags=re.IGNORECASE)
+    # 4. Eliminar sufijos ISA/RAMS (final)
+    name = re.sub(r"[_\-\s]*(isa|rams)$", "", name, flags=re.IGNORECASE)
+    # 5. Solo alfanumérico, minúsculas
+    name = re.sub(r"[^a-z0-9]", "", name.lower())
+    return name
+
+
+def pair_files(
+    isa_names: list[str],
+    rams_names: list[str],
+) -> tuple[dict[str, tuple[str, str]], list[str], list[str]]:
+    """Empareja archivos ISA y RAMS por nombre canónico.
+
+    Args:
+        isa_names: Lista de nombres de archivos ISA.
+        rams_names: Lista de nombres de archivos RAMS.
+
+    Returns:
+        Tupla de:
+        - paired: Mapa nombre_canónico → (nombre_isa, nombre_rams)
+        - unpaired_isa: Archivos ISA sin par
+        - unpaired_rams: Archivos RAMS sin par
+    """
+    isa_canon = {canonize_name(n): n for n in isa_names}
+    rams_canon = {canonize_name(n): n for n in rams_names}
+
+    paired: dict[str, tuple[str, str]] = {}
+    for canon, isa_file in isa_canon.items():
+        if canon in rams_canon:
+            paired[canon] = (isa_file, rams_canon[canon])
+            logger.debug("Par encontrado: '%s' → ISA=%s, RAMS=%s", canon, isa_file, rams_canon[canon])
+
+    unpaired_isa = [isa_canon[c] for c in isa_canon if c not in rams_canon]
+    unpaired_rams = [rams_canon[c] for c in rams_canon if c not in isa_canon]
+
+    if unpaired_isa:
+        logger.warning("Archivos ISA sin par RAMS: %s", unpaired_isa)
+    if unpaired_rams:
+        logger.warning("Archivos RAMS sin par ISA: %s", unpaired_rams)
+
+    return paired, unpaired_isa, unpaired_rams
+
+
+# ---------------------------------------------------------------------------
+# 2. Lectura de archivos
+# ---------------------------------------------------------------------------
+
+def read_file(file_obj: IO[bytes], filename: str) -> pd.DataFrame:
+    """Lee un archivo subido (BytesIO o UploadedFile) a DataFrame.
+
+    Soporta .xlsx, .xls, .csv (con coma decimal y auto-detección de separador).
+    No escribe nada a disco — opera completamente en memoria.
+
+    Args:
+        file_obj: Objeto con interfaz de archivo (read() / seek()).
+        filename: Nombre original del archivo (para detectar extensión).
+
+    Returns:
+        DataFrame con el contenido del archivo.
+
+    Raises:
+        ValueError: Si la extensión no es soportada o el archivo no se puede leer.
+    """
+    ext = _get_extension(filename)
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Formato no soportado: '{ext}'. "
+            f"Use: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+
+    data = io.BytesIO(file_obj.read() if hasattr(file_obj, "read") else file_obj)
+
+    if ext == ".csv":
+        return _read_csv(data, filename)
+    elif ext == ".xlsx":
+        return _read_excel(data, filename, engine="openpyxl")
+    elif ext == ".xls":
+        return _read_excel(data, filename, engine="xlrd")
+    else:  # pragma: no cover
+        raise ValueError(f"Extensión inesperada: {ext}")
+
+
+def _get_extension(filename: str) -> str:
+    match = re.search(r"(\.[^.]+)$", filename.lower())
+    return match.group(1) if match else ""
+
+
+def _read_csv(data: io.BytesIO, filename: str) -> pd.DataFrame:
+    """Intenta leer CSV probando separadores comunes."""
+    for sep in [";", ",", "\t", "|"]:
+        data.seek(0)
         try:
-            serie = df[col].astype(str).str.upper().str.strip()
-            if serie.head(50).str.contains(r"REPRO|ADMISIBLE|REPET").any():
-                return col
+            df = pd.read_csv(data, sep=sep, decimal=",", thousands=".", encoding="utf-8-sig")
+            if df.shape[1] > 1:
+                logger.debug("CSV '%s' leído con sep='%s'", filename, sep)
+                return df
         except Exception:
-            pass
-    return None
-
-def normalizar_tipo(raw: str) -> str:
-    if pd.isna(raw):
-        return ""
-    t = str(raw)
-    t = t.replace('*', '')
-    t = t.replace('\u00A0', ' ')
-    t = strip_accents(t).upper().strip()
-    return t
-
-def construir_umbrales(df: pd.DataFrame, alias_prop: Dict[str, str]) -> Dict[Tuple[str, str], float]:
-    col_prop = next((c for c in df.columns if str(c).strip().lower() == 'propiedad'), None)
-    if col_prop is None:
-        raise ValueError("La matriz de umbrales no tiene columna 'Propiedad'.")
-    col_tipo = detectar_columna_tipo(df)
-    if col_tipo is None:
-        raise ValueError("No se localiza columna 'Tipo' en la matriz de umbrales.")
-
-    cortes_cols: List[Tuple[str, str]] = []
-    for c in df.columns:
-        if c in {col_prop, col_tipo}:
-            continue
-        cc = canon_corte(str(c))
-        if cc in {"", "UNIDAD", "CRUDO"}:
-            continue
-        cortes_cols.append((str(c), cc))
-
-    umbrales: Dict[Tuple[str, str], float] = {}
-    prop_actual = ""
-
-    for _, row in df.iterrows():
-        prop_raw = row.get(col_prop)
-        prop_canon = canon_prop(prop_raw, alias_prop)
-        if prop_canon:
-            prop_actual = prop_canon
-        if not prop_actual:
-            continue
-        tipo = normalizar_tipo(row.get(col_tipo))
-        if not ("REPRO" in tipo or "ADMISIBLE" in tipo or "REPET" in tipo):
             continue
 
-        for col_o, cc in cortes_cols:
-            val = row.get(col_o)
-            if pd.isna(val):
-                continue
-            vs = str(val).strip()
-            if vs == "":
-                continue
-            try:
-                v = float(vs.replace(',', '.'))
-            except Exception:
-                continue
-            key = (prop_actual, cc)
-            if key in umbrales:
-                if v > umbrales[key]:
-                    umbrales[key] = v
-            else:
-                umbrales[key] = v
-    return umbrales
-
-# ===========
-# Reglas
-# ===========
-def es_corte_pesado(corte: str) -> bool:
-    s = corte.upper().strip()
-    if any(tag in s for tag in ["C6", "C7", "C8", "C9", "C10"]):
-        return True
-    if s.endswith('+'):
-        try:
-            base = float(s[:-1])
-            return base >= 299
-        except Exception:
-            return False
-    if '-' in s:
-        try:
-            start = float(s.split('-')[0])
-            return start >= 299
-        except Exception:
-            return False
-    return False
-
-def estado_corte(valor: float, umbral: float, tol: float) -> int:
-    if valor <= umbral:
-        return 0
-    elif valor <= umbral * (1.0 + tol):
-        return 1
-    else:
-        return 2
-
-def _prop_base_para_umbral(prop_canon: str) -> str:
-    if prop_canon == "PESO ACUMULADO":
-        return "PESO"
-    return prop_canon
-
-def _buscar_umbral(
-    umbrales: Dict[Tuple[str, str], float],
-    prop_canon: str,
-    corte_key: str
-) -> Optional[float]:
-    thr = umbrales.get((prop_canon, corte_key))
-    if thr is not None:
-        return thr
-    base_prop = _prop_base_para_umbral(prop_canon)
-    if base_prop != prop_canon:
-        thr2 = umbrales.get((base_prop, corte_key))
-        if thr2 is not None:
-            return thr2
-    return None
-
-def clasificar_propiedad(
-    errores_fila: Dict[str, float],
-    prop_canon: str,
-    umbrales: Dict[Tuple[str, str], float],
-    tol: float,
-    pct_ok_amarillo: float,
-    pct_rojo_rojo: float,
-    tol_pesados: float = 0.6,
-    tol_azufre_verde: float = 2.0,
-    tol_densidad_verde: float = 2.0,
-):
-    estados: Dict[str, str] = {}
-    total_con_valor = 0
-    total_valid = 0
-    n_verde = n_amarillo = n_rojo = 0
-    rojo_absoluto = False
-
-    corte_peor = None
-    error_peor = None
-    umbral_peor = None
-    ratio_peor = -1.0
-
-    base_prop = _prop_base_para_umbral(prop_canon)
-    tiene_umbral_prop = any(k[0] == base_prop for k in umbrales.keys())
-
-    for corte, valor in errores_fila.items():
-        if valor is None or (isinstance(valor, float) and pd.isna(valor)):
-            estados[corte] = "(no numérico)"
-            continue
-        try:
-            v = float(str(valor).replace(",", "."))
-        except Exception:
-            estados[corte] = "(no numérico)"
-            continue
-
-        total_con_valor += 1
-
-        cc = canon_corte(corte)
-        thr = _buscar_umbral(umbrales, prop_canon, cc)
-        if thr is None:
-            thr = _buscar_umbral(umbrales, prop_canon, corte)
-        if thr is None:
-            estados[corte] = "(sin umbral)"
-            continue
-
-        total_valid += 1
-
-        try:
-            ratio = v / thr
-        except ZeroDivisionError:
-            ratio = float("inf")
-
-        if ratio > ratio_peor:
-            ratio_peor = ratio
-            corte_peor = corte
-            error_peor = v
-            umbral_peor = thr
-
-        if v > 3 * thr:
-            estados[corte] = "ROJO"; n_rojo += 1; rojo_absoluto = True
-            continue
-
-        if prop_canon in ("AZUFRE", "DENSIDAD", "DENSIDAD A 15C", "DENSIDAD A 15"):
-            if v <= 3 * thr:
-                estados[corte] = "VERDE"; n_verde += 1
-            elif 2 * thr < v <= 3 * thr:
-                estados[corte] = "AMARILLO"; n_amarillo += 1
-            else:
-                estados[corte] = "ROJO"; n_rojo += 1
-            continue
-
-        tol_local = tol_pesados if es_corte_pesado(corte) else tol
-        umbral_verde = thr
-        umbral_amarillo = thr * (1 + tol_local)
-
-        if v <= umbral_verde:
-            estados[corte] = "VERDE"; n_verde += 1
-        elif v <= umbral_amarillo:
-            estados[corte] = "AMARILLO"; n_amarillo += 1
-        else:
-            estados[corte] = "ROJO"; n_rojo += 1
-
-    if total_con_valor == 0:
-        return "", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-    if not tiene_umbral_prop or total_valid == 0:
-        return "NA", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-
-    if rojo_absoluto:
-        return "ROJO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-
-    verde_pct = n_verde / total_valid
-    rojo_pct = n_rojo / total_valid
-
-    if rojo_pct > pct_rojo_rojo:
-        return "ROJO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-    if verde_pct >= pct_ok_amarillo:
-        return "VERDE", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-    return "AMARILLO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-
-# ===========
-# Lectura de tablas (desde bytes / nombres)
-# ===========
-def leer_tabla_errores_filelike(file_bytes: bytes, filename: str, sheet: Optional[str] = None) -> pd.DataFrame:
-    ext = os.path.splitext(filename)[1].lower()
-    bio = io.BytesIO(file_bytes)
-    if ext in {".xlsx", ".xls"}:
-        try:
-            return pd.read_excel(bio, sheet_name=sheet or 0, engine="openpyxl")
-        except Exception:
-            bio.seek(0)
-            try:
-                # xlrd >= 2.0 sólo soporta .xls; si el archivo es xlsx fallará (es normal)
-                return pd.read_excel(bio, sheet_name=sheet or 0, engine="xlrd")
-            except Exception:
-                bio.seek(0)
-                try:
-                    return pd.read_excel(bio, sheet_name=sheet or 0, engine="pyxlsb")
-                except Exception as e:
-                    raise ValueError(f"No se pudo leer {filename} con ningún engine válido: {e}")
-    elif ext == ".csv":
-        return pd.read_csv(bio, sep=",", decimal=",", engine="python", encoding="utf-8")
-    else:
-        raise ValueError(f"Archivo no soportado: {filename}")
-
-def detectar_cortes_en_df(df: pd.DataFrame) -> List[Tuple[str, str]]:
-    cortes = []
-    for c in df.columns:
-        cname = str(c)
-        low = cname.strip().lower()
-        if low in {"propiedad", "unidad", "validacion", "validación", "validacion auto", "validación auto"}:
-            continue
-        cc = canon_corte(cname)
-        if cc:
-            cortes.append((cname, cc))
-    return cortes
-
-def crear_semantica_alias() -> Dict[str, str]:
-    raw = {
-        "PESO": "PESO",
-        "PESO ACUMULADO": "PESO ACUMULADO",
-        "DENSIDAD": "DENSIDAD",
-        "DENSIDAD A 15C": "DENSIDAD",
-        "DENSIDAD A 15": "DENSIDAD",
-        "DENSIDAD 15C": "DENSIDAD",
-        "VISCOSIDAD 50": "VISCOSIDAD 50",
-        "VISCOSIDAD 50C": "VISCOSIDAD 50",
-        "VISCOSIDAD A 50C": "VISCOSIDAD 50",
-        "VISCOSIDAD 100": "VISCOSIDAD 100",
-        "VISCOSIDAD 100C": "VISCOSIDAD 100",
-        "VISCOSIDAD A 100C": "VISCOSIDAD 100",
-        "AZUFRE": "AZUFRE",
-        "AZUFRE MERCAPTANO": "AZUFRE MERCAPTANO",
-        "RON": "RON", "NOR": "RON", "NOR CLARO": "RON", "N O R CLARO": "RON",
-        "MON": "MON", "NOM": "MON", "NOM CLARO": "MON", "N O M CLARO": "MON",
-        "N DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "NUMERO DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "NO DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "INDICE DE REFRACCION 70C": "INDICE DE REFRACCION 70C",
-        "PUNTO DE VERTIDO": "PUNTO DE VERTIDO",
-        "PUNTO DE NIEBLA": "PUNTO DE NIEBLA",
-        "PUNTO DE CRISTALIZACION": "PUNTO DE CRISTALIZACION",
-        "PUNTO DE ANILINA": "PUNTO DE ANILINA",
-        "PIONA (%VOL), N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA (%VOL), I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA (%VOL), NAFTENOS": "PIONA NAFTENOS",
-        "PIONA (%VOL), POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA (%VOL), AROMATICOS": "PIONA AROMATICOS",
-        "PIONA (%VOL), SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "PIONA N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA NAFTENOS": "PIONA NAFTENOS",
-        "PIONA POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA AROMATICOS": "PIONA AROMATICOS",
-        "PIONA SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "PIONA, N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA, I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA, NAFTENOS": "PIONA NAFTENOS",
-        "PIONA, POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA, AROMATICOS": "PIONA AROMATICOS",
-        "PIONA, SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "NITROGENO": "NITROGENO",
-        "NITROGENO BASICO": "NITROGENO BASICO",
-        "RESIDUO DE CARBON": "RESIDUO DE CARBON",
-        "CARBONO CONRADSON": "RESIDUO DE CARBON",
-        "ASFALTENOS": "ASFALTENOS",
-        "MONOAROMATICOS": "MONOAROMATICOS",
-        "DIAROMATICOS": "DIAROMATICOS",
-        "TRIAROMATICOS Y SUPERIORES": "TRIAROMATICOS",
-        "CONTENIDO EN C2": "CONTENIDO EN C2",
-        "CONTENIDO EN C3": "CONTENIDO EN C3",
-        "CONTENIDO EN IC4": "CONTENIDO EN IC4",
-        "CONTENIDO EN NC4": "CONTENIDO EN NC4",
-        "NIQUEL": "NIQUEL",
-        "VANADIO": "VANADIO",
-        "SILICIO": "SILICIO",
-    }
-
-    def _norm(s: str) -> str:
-        if s is None:
-            return ""
-        t = strip_accents(str(s)).upper().strip()
-        for ch in ['.', 'º', '°']:
-            t = t.replace(ch, '')
-        t = re.sub(r"\s+", " ", t)
-        return t
-
-    out: Dict[str, str] = {}
-    for k, v in raw.items():
-        out[_norm(k)] = _norm(v)
-    return out
-
-# ===========
-# Excel (formato)
-# ===========
-def add_conditional_formatting_text(ws, cell_range: str):
-    fill_verde = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_amar = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-    fill_rojo = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    fill_gris = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-
-    dxf_v = DifferentialStyle(fill=fill_verde)
-    dxf_a = DifferentialStyle(fill=fill_amar)
-    dxf_r = DifferentialStyle(fill=fill_rojo)
-    dxf_g = DifferentialStyle(fill=fill_gris)
-
-    rule_v = Rule(type="containsText", operator="containsText", text="VERDE", dxf=dxf_v)
-    rule_a = Rule(type="containsText", operator="containsText", text="AMARILLO", dxf=dxf_a)
-    rule_r = Rule(type="containsText", operator="containsText", text="ROJO", dxf=dxf_r)
-    rule_n = Rule(type="containsText", operator="containsText", text="NA", dxf=dxf_g)
-
-    ws.conditional_formatting.add(cell_range, rule_v)
-    ws.conditional_formatting.add(cell_range, rule_a)
-    ws.conditional_formatting.add(cell_range, rule_r)
-    ws.conditional_formatting.add(cell_range, rule_n)
-
-def escribir_hoja_df(ws, df: pd.DataFrame):
-    for r in dataframe_to_rows(df, index=False, header=True):
-        ws.append(r)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    for col in ws.columns:
-        max_len = max((len(str(cell.value)) if cell.value is not None else 0) for cell in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max(10, max_len + 2), 45)
-
-# ===========
-# Motor (adaptado a DataFrames / filelikes)
-# ===========
-def _nombre_base_crudo(fname: str) -> str:
-    base = os.path.splitext(os.path.basename(fname))[0]
-    m = re.search(r"([A-Za-z]{3}-\d{4}-\d+)", base)
-    if m:
-        return m.group(1).upper()
-    base = re.sub(r"^(?:ISA|RAMS)[_\-]+", "", base, flags=re.IGNORECASE)
-    base = re.sub(r"([_\-])(ISA|RAMS)(?:([_\-]?v?\d{1,3})?)$", "", base, flags=re.IGNORECASE)
-    base = re.sub(r"([_\-])(ISA|RAMS)(?:[_\-].*)?$", "", base, flags=re.IGNORECASE)
-    return base.strip("_- ")
-
-def _indice_prop(df: pd.DataFrame, alias_prop: Dict[str, str]) -> Dict[str, int]:
-    idx = {}
-    if 'Propiedad' not in df.columns:
-        return idx
-    for i, v in enumerate(df['Propiedad'].tolist()):
-        p = canon_prop(v, alias_prop)
-        if p:
-            idx[p] = i
-    return idx
-
-def _mapa_cortes(df: pd.DataFrame) -> Dict[str, str]:
-    out = {}
-    for c in df.columns:
-        cc = canon_corte(c)
-        low = str(c).strip().lower()
-        if cc and low not in {"propiedad", "unidad", "validacion", "validación", "validacion auto", "validación auto"}:
-            out[cc] = c
-    return out
-
-def _float_or_none(x):
-    if x is None:
-        return None
+    # Último intento: dejar que pandas auto-detecte
+    data.seek(0)
     try:
-        s = str(x).strip()
-        if s == "":
-            return None
-        return float(s.replace(",", "."))
-    except Exception:
-        return None
+        df = pd.read_csv(data, sep=None, engine="python", decimal=",", encoding="utf-8-sig")
+        logger.debug("CSV '%s' leído con separador auto-detectado", filename)
+        return df
+    except Exception as e:
+        raise ValueError(f"No se pudo parsear CSV '{filename}': {e}") from e
 
-def calcular_errores_crudo_df(
+
+def _read_excel(data: io.BytesIO, filename: str, engine: str) -> pd.DataFrame:
+    """Lee archivo Excel con el engine indicado."""
+    try:
+        df = pd.read_excel(data, engine=engine)
+        logger.debug("Excel '%s' leído con engine='%s', shape=%s", filename, engine, df.shape)
+        return df
+    except Exception as e:
+        raise ValueError(f"Error leyendo '{filename}' con engine='{engine}': {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# 3. Validación de umbrales
+# ---------------------------------------------------------------------------
+
+def validate_thresholds(config: ThresholdConfig) -> None:
+    """Valida que los umbrales globales y por propiedad sean coherentes.
+
+    Args:
+        config: Configuración de umbrales a validar.
+
+    Raises:
+        ValueError: Si algún umbral es inválido.
+    """
+    if not (0 <= config.default_green < config.default_yellow):
+        raise ValueError(
+            f"Umbrales globales inválidos: verde={config.default_green}, "
+            f"amarillo={config.default_yellow}. "
+            f"Se requiere 0 ≤ verde < amarillo."
+        )
+    for prop, (green, yellow) in config.thresholds.items():
+        if not (0 <= green < yellow):
+            raise ValueError(
+                f"Umbrales inválidos para '{prop}': verde={green}, amarillo={yellow}. "
+                f"Se requiere 0 ≤ verde < amarillo."
+            )
+
+
+# ---------------------------------------------------------------------------
+# 4. Cálculo de errores
+# ---------------------------------------------------------------------------
+
+def align_dataframes(
     df_isa: pd.DataFrame,
     df_rams: pd.DataFrame,
-    path_isa_name: str,
-    umbrales: Dict[Tuple[str, str], float],
-    alias_prop: Dict[str, str],
-    tol: float,
-    pct_ok_amarillo: float,
-    pct_rojo_rojo: float,
-    tol_pesados: float,
-    hoja_resumen: Dict[str, Dict[str, str]],
-) -> Tuple[str, pd.DataFrame, List[str], List[str]]:
-    if 'Propiedad' not in df_isa.columns:
-        raise ValueError(f"{path_isa_name} no tiene columna 'Propiedad'.")
-    if 'Propiedad' not in df_rams.columns:
-        raise ValueError(f"RAMS no tiene columna 'Propiedad'.")
+    key_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Alinea dos DataFrames por la columna clave (cortes).
 
-    cortes_isa = detectar_cortes_en_df(df_isa)
-    if not cortes_isa:
-        raise ValueError(f"{path_isa_name} no contiene cortes reconocibles.")
+    Hace un merge outer para preservar todos los cortes de ISA.
+    Los cortes de RAMS sin par ISA se descartan (ISA es la referencia).
 
-    idx_rams = _indice_prop(df_rams, alias_prop)
-    cortes_map_rams = _mapa_cortes(df_rams)
+    Args:
+        df_isa: DataFrame ISA (fuente de propiedades y cortes).
+        df_rams: DataFrame RAMS (predicciones a validar).
+        key_col: Nombre de la columna de corte/índice clave.
 
-    columnas_cortes_visibles = [cname for (cname, _cc) in cortes_isa]
-    df_out_cols = ["Propiedad", "Semaforo", "Corte_peor", "Error_peor", "Umbral_peor"] + columnas_cortes_visibles
-    df_out = pd.DataFrame(columns=df_out_cols)
+    Returns:
+        Tupla (df_isa_alineado, df_rams_alineado) con mismo índice.
 
-    crude_name = _nombre_base_crudo(path_isa_name)
-    hoja_name = crude_name[:31]
-    orden_props_local = []
+    Raises:
+        ValueError: Si key_col no existe en alguno de los DataFrames.
+    """
+    for label, df in [("ISA", df_isa), ("RAMS", df_rams)]:
+        if key_col not in df.columns:
+            raise ValueError(
+                f"Columna clave '{key_col}' no encontrada en {label}. "
+                f"Columnas disponibles: {list(df.columns)}"
+            )
 
-    for _, row_isa in df_isa.iterrows():
-        prop_raw = row_isa.get("Propiedad")
-        prop_canon = canon_prop(prop_raw, alias_prop)
-        if not prop_canon:
-            continue
-        orden_props_local.append(prop_canon)
-        if prop_canon not in idx_rams:
-            continue
+    isa_indexed = df_isa.set_index(key_col)
+    rams_indexed = df_rams.set_index(key_col)
 
-        row_rams = df_rams.iloc[idx_rams[prop_canon]]
+    # Reindexar RAMS a los cortes de ISA (ISA es la referencia)
+    rams_reindexed = rams_indexed.reindex(isa_indexed.index)
 
-        errores_fila: Dict[str, float] = {}
-        fila_out = {"Propiedad": str(prop_raw)}
+    return isa_indexed, rams_reindexed
 
-        for (cname_isa, cc_isa) in cortes_isa:
-            col_rams = cortes_map_rams.get(cc_isa)
-            if col_rams is None:
-                fila_out[cname_isa] = None
-                continue
-            isa_val = _float_or_none(row_isa.get(cname_isa))
-            rams_val = _float_or_none(row_rams.get(col_rams))
-            err = abs(isa_val - rams_val) if (isa_val is not None and rams_val is not None) else None
-            errores_fila[cc_isa] = err
-            fila_out[cname_isa] = err
 
-        sem, _estados, corte_peor, error_peor, _ratio, umbral_peor = clasificar_propiedad(
-            errores_fila,
-            prop_canon,
-            umbrales,
-            tol=tol,
-            pct_ok_amarillo=pct_ok_amarillo,
-            pct_rojo_rojo=pct_rojo_rojo,
-            tol_pesados=tol_pesados,
+def compute_errors(
+    df_isa: pd.DataFrame,
+    df_rams: pd.DataFrame,
+    key_col: str,
+    prop_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """Calcula errores absolutos |ISA - RAMS| por corte y propiedad.
+
+    Las propiedades y cortes se toman EXCLUSIVAMENTE de ISA.
+    Si RAMS no tiene un corte o propiedad, el error es NaN.
+
+    Args:
+        df_isa: DataFrame ISA con cortes y propiedades.
+        df_rams: DataFrame RAMS con las mismas propiedades.
+        key_col: Columna que identifica los cortes (ej. 'corte_C').
+        prop_cols: Lista de propiedades a comparar. Si None, usa todas
+                   las columnas numéricas de ISA excepto key_col.
+
+    Returns:
+        DataFrame de errores absolutos con mismo índice/columnas que ISA.
+    """
+    isa_idx, rams_idx = align_dataframes(df_isa, df_rams, key_col)
+
+    if prop_cols is None:
+        prop_cols = [
+            c for c in isa_idx.select_dtypes(include="number").columns
+        ]
+
+    # Filtrar columnas existentes en ISA
+    prop_cols = [c for c in prop_cols if c in isa_idx.columns]
+    if not prop_cols:
+        raise ValueError(
+            "No se encontraron columnas de propiedades numéricas para comparar."
         )
 
-        fila_out["Semaforo"] = sem
-        fila_out["Corte_peor"] = corte_peor
-        fila_out["Error_peor"] = error_peor
-        fila_out["Umbral_peor"] = umbral_peor
+    isa_num = isa_idx[prop_cols]
+    rams_num = rams_idx.reindex(columns=prop_cols)
 
-        hoja_resumen.setdefault(prop_canon, {})[crude_name] = sem
-        df_out.loc[len(df_out)] = fila_out
+    # Operación vectorizada
+    errors = (isa_num - rams_num).abs()
+    logger.debug("Errores calculados: shape=%s, NaNs=%d", errors.shape, errors.isna().sum().sum())
+    return errors
 
-    return hoja_name, df_out, columnas_cortes_visibles, orden_props_local
 
-def _sem_global_por_crudo(
-    resumen: Dict[str, Dict[str, str]],
-    pct_ok_amarillo: float,
-    pct_rojo_rojo: float,
-) -> Dict[str, str]:
-    crudos = sorted({c for m in resumen.values() for c in m.keys()})
-    out = {c: "" for c in crudos}
-    for cr in crudos:
-        vals = [m.get(cr, "") for m in resumen.values()]
-        vals = [v for v in vals if v in {"VERDE", "AMARILLO", "ROJO"}]
-        if not vals:
-            out[cr] = ""
-            continue
-        total = len(vals)
-        verde = sum(1 for v in vals if v == "VERDE")
-        rojo = sum(1 for v in vals if v == "ROJO")
-        rojo_pct = rojo / total
-        verde_pct = verde / total
-        if rojo_pct > pct_rojo_rojo:
-            out[cr] = "ROJO"
-        elif verde_pct >= pct_ok_amarillo:
-            out[cr] = "VERDE"
+# ---------------------------------------------------------------------------
+# 5. Clasificación de semáforo
+# ---------------------------------------------------------------------------
+
+def classify_semaforo(
+    error: float,
+    threshold_green: float,
+    threshold_yellow: float,
+) -> str:
+    """Clasifica un error absoluto como verde, amarillo o rojo.
+
+    Args:
+        error: Valor absoluto del error |ISA - RAMS|.
+        threshold_green: Límite superior (inclusivo) para verde.
+        threshold_yellow: Límite superior (inclusivo) para amarillo.
+
+    Returns:
+        'verde', 'amarillo' o 'rojo'.
+
+    Raises:
+        ValueError: Si los umbrales son incoherentes.
+    """
+    if threshold_green < 0 or threshold_green >= threshold_yellow:
+        raise ValueError(
+            f"Umbrales incoherentes: verde={threshold_green}, amarillo={threshold_yellow}"
+        )
+    if pd.isna(error):
+        return "rojo"  # dato faltante → peor caso
+    if error <= threshold_green:
+        return "verde"
+    if error <= threshold_yellow:
+        return "amarillo"
+    return "rojo"
+
+
+def classify_matrix(
+    error_matrix: pd.DataFrame,
+    config: ThresholdConfig,
+) -> pd.DataFrame:
+    """Aplica classify_semaforo a toda la matriz de errores.
+
+    Args:
+        error_matrix: DataFrame de errores absolutos.
+        config: Configuración de umbrales por propiedad.
+
+    Returns:
+        DataFrame de misma forma con strings 'verde'/'amarillo'/'rojo'.
+    """
+    result = pd.DataFrame(index=error_matrix.index, columns=error_matrix.columns, dtype=str)
+    for col in error_matrix.columns:
+        green, yellow = config.get_thresholds(col)
+        result[col] = error_matrix[col].apply(
+            lambda e: classify_semaforo(e, green, yellow)
+        )
+    return result
+
+
+def build_summary(semaforo_matrices: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Construye resumen global por crudo.
+
+    Args:
+        semaforo_matrices: Mapa nombre_crudo → DataFrame de semáforos.
+
+    Returns:
+        DataFrame con columnas: crudo, verde_pct, amarillo_pct, rojo_pct,
+        total_celdas, estado_global.
+    """
+    rows = []
+    for name, matrix in semaforo_matrices.items():
+        flat = matrix.values.flatten()
+        total = len(flat)
+        verde = (flat == "verde").sum()
+        amarillo = (flat == "amarillo").sum()
+        rojo = (flat == "rojo").sum()
+
+        if rojo > 0:
+            estado = "rojo"
+        elif amarillo > 0:
+            estado = "amarillo"
         else:
-            out[cr] = "AMARILLO"
-    return out
+            estado = "verde"
 
-def exportar_resultados_a_bytes(
-    hojas_crudos: List[Tuple[str, pd.DataFrame]],
-    resumen: Dict[str, Dict[str, str]],
-    orden_propiedades: List[str],
-    pct_ok_amarillo: float,
-    pct_rojo_rojo: float,
-) -> bytes:
-    wb = Workbook()
-    ws0 = wb.active
-    ws0.title = "Resumen"
+        rows.append({
+            "crudo": name,
+            "verde_%": round(100 * verde / total, 1) if total else 0,
+            "amarillo_%": round(100 * amarillo / total, 1) if total else 0,
+            "rojo_%": round(100 * rojo / total, 1) if total else 0,
+            "total_celdas": total,
+            "estado_global": estado,
+        })
 
-    todos_crudos = sorted({c for m in resumen.values() for c in m.keys()})
-    global_por_crudo = _sem_global_por_crudo(resumen, pct_ok_amarillo, pct_rojo_rojo)
+    return pd.DataFrame(rows)
 
-    data = []
-    if todos_crudos:
-        row_global = {"Propiedad": "GLOBAL"}
-        for cr in todos_crudos:
-            row_global[cr] = global_por_crudo.get(cr, "")
-        data.append(row_global)
 
-    for prop in orden_propiedades:
-        if prop in resumen:
-            row = {"Propiedad": prop}
-            for cr in todos_crudos:
-                row[cr] = resumen[prop].get(cr, "")
-            data.append(row)
+# ---------------------------------------------------------------------------
+# 6. Pipeline completo
+# ---------------------------------------------------------------------------
 
-    df_res = pd.DataFrame(data) if data else pd.DataFrame(columns=["Propiedad"])
-    escribir_hoja_df(ws0, df_res)
+def run_validation(
+    isa_files: dict[str, IO[bytes]],
+    rams_files: dict[str, IO[bytes]],
+    key_col: str,
+    config: ThresholdConfig,
+    prop_cols: list[str] | None = None,
+) -> ValidationResult:
+    """Ejecuta el pipeline completo de validación.
 
-    if df_res.shape[0] > 0 and len(todos_crudos) > 0:
-        from openpyxl.utils import get_column_letter
-        start_row = 2
-        end_row = df_res.shape[0] + 1
-        for j in range(2, 2 + len(todos_crudos)):
-            col_letter = get_column_letter(j)
-            add_conditional_formatting_text(ws0, f"{col_letter}{start_row}:{col_letter}{end_row}")
+    Args:
+        isa_files: Mapa nombre_archivo → objeto de archivo ISA.
+        rams_files: Mapa nombre_archivo → objeto de archivo RAMS.
+        key_col: Columna clave de cortes.
+        config: Configuración de umbrales.
+        prop_cols: Propiedades a comparar (None = todas las numéricas).
 
-    for hoja, df_out in hojas_crudos:
-        ws = wb.create_sheet(title=hoja)
-        escribir_hoja_df(ws, df_out)
-        if df_out.shape[0] > 0:
-            start_row = 2
-            end_row = df_out.shape[0] + 1
-            add_conditional_formatting_text(ws, f"B{start_row}:B{end_row}")
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-def emparejar_subidos(
-    isa_files: Iterable[Tuple[str, bytes]],
-    rams_files: Iterable[Tuple[str, bytes]]
-) -> List[Tuple[Tuple[str, bytes], Tuple[str, bytes]]]:
+    Returns:
+        ValidationResult completo.
     """
-    Recibe listas de (filename, bytes) para ISA y RAMS, y devuelve pares emparejados por nombre base.
-    """
-    def _map(files):
-        out = {}
-        for name, b in files:
-            base = _nombre_base_crudo(name)
-            out[base] = (name, b)
-        return out
+    validate_thresholds(config)
 
-    isa_map = _map(isa_files)
-    rams_map = _map(rams_files)
-    comunes = sorted(set(isa_map.keys()) & set(rams_map.keys()))
-    return [(isa_map[b], rams_map[b]) for b in comunes]
-
-def run_validation_in_memory(
-    matriz_bytes: bytes, matriz_name: str, matriz_sheet: Optional[str],
-    isa_files: Iterable[Tuple[str, bytes]],
-    rams_files: Iterable[Tuple[str, bytes]],
-    tolerancia: float = 0.1,
-    pct_ok_amarillo: float = 0.9,
-    pct_rojo_rojo: float = 0.30,
-    tol_pesados: float = 0.60,
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, str]], List[Tuple[str, pd.DataFrame]], List[str], bytes]:
-    """
-    Orquesta todo:
-    - Lee matriz de umbrales
-    - Empareja archivos
-    - Calcula hojas por crudo y resumen
-    - Devuelve:
-        df_resumen_visual, resumen_dict, hojas, orden_propiedades, excel_bytes
-    """
-    alias_prop = crear_semantica_alias()
-    df_matriz = leer_tabla_errores_filelike(matriz_bytes, matriz_name, sheet=matriz_sheet)
-    umbrales = construir_umbrales(df_matriz, alias_prop)
-
-    pares = emparejar_subidos(isa_files, rams_files)
-    if not pares:
-        raise ValueError("No se han encontrado pares ISA/RAMS con nombres base comunes.")
-
-    resumen: Dict[str, Dict[str, str]] = {}
-    hojas: List[Tuple[str, pd.DataFrame]] = []
-    orden_propiedades: List[str] = []
-
-    for (isa_name, isa_b), (_rams_name, rams_b) in pares:
-        df_isa = leer_tabla_errores_filelike(isa_b, isa_name, sheet=None)
-        df_rams = leer_tabla_errores_filelike(rams_b, _rams_name, sheet=None)
-        hoja_name, df_out, _cortes_vis, orden_local = calcular_errores_crudo_df(
-            df_isa=df_isa,
-            df_rams=df_rams,
-            path_isa_name=isa_name,
-            umbrales=umbrales,
-            alias_prop=alias_prop,
-            tol=tolerancia,
-            pct_ok_amarillo=pct_ok_amarillo,
-            pct_rojo_rojo=pct_rojo_rojo,
-            tol_pesados=tol_pesados,
-            hoja_resumen=resumen,
-        )
-        if not orden_propiedades:
-            orden_propiedades = orden_local
-        hojas.append((hoja_name, df_out))
-
-    # Construir DataFrame resumen para UI (igual que Excel pero en pandas)
-    todos_crudos = sorted({c for m in resumen.values() for c in m.keys()})
-    data = []
-    # Fila GLOBAL
-    if todos_crudos:
-        global_por_crudo = _sem_global_por_crudo(resumen, pct_ok_amarillo, pct_rojo_rojo)
-        row_global = {"Propiedad": "GLOBAL", **{cr: global_por_crudo.get(cr, "") for cr in todos_crudos}}
-        data.append(row_global)
-    for prop in orden_propiedades:
-        if prop in resumen:
-            data.append({"Propiedad": prop, **{cr: resumen[prop].get(cr, "") for cr in todos_crudos}})
-
-    df_resumen = pd.DataFrame(data) if data else pd.DataFrame(columns=["Propiedad"])
-
-    excel_bytes = exportar_resultados_a_bytes(
-        hojas_crudos=hojas,
-        resumen=resumen,
-        orden_propiedades=orden_propiedades,
-        pct_ok_amarillo=pct_ok_amarillo,
-        pct_rojo_rojo=pct_rojo_rojo,
+    # Emparejar archivos
+    paired_map, unpaired_isa, unpaired_rams = pair_files(
+        list(isa_files.keys()), list(rams_files.keys())
     )
-    return df_resumen, resumen, hojas, orden_propiedades, excel_bytes
+
+    result = ValidationResult(unpaired_isa=unpaired_isa, unpaired_rams=unpaired_rams)
+
+    for canon_name, (isa_fname, rams_fname) in paired_map.items():
+        try:
+            logger.info("Procesando par: %s", canon_name)
+            df_isa = read_file(isa_files[isa_fname], isa_fname)
+            df_rams = read_file(rams_files[rams_fname], rams_fname)
+
+            errors = compute_errors(df_isa, df_rams, key_col, prop_cols)
+            semaforo = classify_matrix(errors, config)
+
+            result.paired_names.append(canon_name)
+            result.error_matrices[canon_name] = errors
+            result.semaforo_matrices[canon_name] = semaforo
+
+        except Exception as e:
+            logger.error("Error procesando '%s': %s", canon_name, e)
+            # Reportar como no procesado pero continuar con los demás
+            result.unpaired_isa.append(f"{isa_fname} [ERROR: {e}]")
+
+    if result.has_results:
+        result.summary = build_summary(result.semaforo_matrices)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 7. Exportación a Excel
+# ---------------------------------------------------------------------------
+
+def build_excel(result: ValidationResult, config: ThresholdConfig) -> bytes:
+    """Genera un archivo Excel con errores, semáforos y resumen por crudo.
+
+    Usa openpyxl directamente para máxima compatibilidad con Streamlit Cloud.
+    No usa pd.Styler (frágil en Cloud).
+
+    Args:
+        result: Resultado de validación.
+        config: Configuración de umbrales (para leyenda).
+
+    Returns:
+        Bytes del archivo Excel listo para descarga.
+    """
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # eliminar hoja vacía por defecto
+
+    # Hoja resumen
+    _write_summary_sheet(wb, result)
+
+    # Hoja por cada crudo: errores + semáforo
+    for name in result.paired_names:
+        error_df = result.error_matrices[name]
+        semaforo_df = result.semaforo_matrices[name]
+        sheet_name = name[:28]  # Excel limita 31 chars; dejar margen
+        _write_crudo_sheet(wb, sheet_name, error_df, semaforo_df)
+
+    # Hoja de leyenda/configuración
+    _write_legend_sheet(wb, config)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def _write_summary_sheet(wb: openpyxl.Workbook, result: ValidationResult) -> None:
+    ws = wb.create_sheet("Resumen")
+    if result.summary.empty:
+        ws.cell(1, 1, "Sin resultados")
+        return
+
+    headers = list(result.summary.columns)
+    _write_header_row(ws, headers, row=1)
+
+    for r_idx, row in enumerate(result.summary.itertuples(index=False), start=2):
+        for c_idx, val in enumerate(row, start=1):
+            cell = ws.cell(r_idx, c_idx, val)
+            # Colorear columna estado_global
+            if headers[c_idx - 1] == "estado_global":
+                cell.fill = _semaforo_fill(str(val))
+
+    _auto_width(ws)
+
+
+def _write_crudo_sheet(
+    wb: openpyxl.Workbook,
+    sheet_name: str,
+    error_df: pd.DataFrame,
+    semaforo_df: pd.DataFrame,
+) -> None:
+    ws = wb.create_sheet(sheet_name)
+    cols = list(error_df.columns)
+
+    # Cabecera
+    ws.cell(1, 1, "corte")
+    _write_header_row(ws, cols, row=1, col_offset=1)
+
+    for r_idx, (idx_val, err_row) in enumerate(error_df.iterrows(), start=2):
+        ws.cell(r_idx, 1, idx_val)
+        for c_idx, col in enumerate(cols, start=2):
+            error_val = err_row[col]
+            semaforo_val = semaforo_df.loc[idx_val, col] if idx_val in semaforo_df.index else "rojo"
+            cell = ws.cell(r_idx, c_idx)
+            cell.value = round(float(error_val), 4) if not pd.isna(error_val) else "N/D"
+            cell.fill = _semaforo_fill(str(semaforo_val))
+            cell.alignment = Alignment(horizontal="center")
+
+    _auto_width(ws)
+
+
+def _write_legend_sheet(wb: openpyxl.Workbook, config: ThresholdConfig) -> None:
+    ws = wb.create_sheet("Leyenda")
+    rows = [
+        ["Semáforo", "Criterio"],
+        ["🟢 Verde", f"Error ≤ {config.default_green}"],
+        ["🟡 Amarillo", f"{config.default_green} < Error ≤ {config.default_yellow}"],
+        ["🔴 Rojo", f"Error > {config.default_yellow} o dato faltante"],
+    ]
+    for r_idx, row in enumerate(rows, start=1):
+        for c_idx, val in enumerate(row, start=1):
+            cell = ws.cell(r_idx, c_idx, val)
+            if r_idx > 1:
+                semaforo = ["verde", "amarillo", "rojo"][r_idx - 2]
+                cell.fill = _semaforo_fill(semaforo)
+            else:
+                cell.font = Font(bold=True)
+    _auto_width(ws)
+
+
+def _write_header_row(
+    ws, headers: list[str], row: int = 1, col_offset: int = 0
+) -> None:
+    header_fill = PatternFill("solid", fgColor="FF1E3A5F")
+    header_font = Font(bold=True, color="FFFFFFFF")
+    for c_idx, h in enumerate(headers, start=1 + col_offset):
+        cell = ws.cell(row, c_idx, h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+
+def _semaforo_fill(semaforo: str) -> PatternFill:
+    color = SEMAFORO_COLORS.get(semaforo, "FFCCCCCC")
+    return PatternFill("solid", fgColor=color)
+
+
+def _auto_width(ws) -> None:
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=8)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 40)

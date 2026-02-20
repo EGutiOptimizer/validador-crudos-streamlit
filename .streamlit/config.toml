@@ -1,7 +1,15 @@
-# .streamlit/config.toml
 [theme]
-primaryColor="#0A66C2"         # color principal (botones, radios, checkboxes)
-backgroundColor="#FFFFFF"      # fondo
-secondaryBackgroundColor="#F5F7FB"
-textColor="#222222"
-font="sans serif"
+# Tema corporativo del Validador de Crudos
+primaryColor = "#1E3A5F"             # azul corporativo oscuro (botones, sliders)
+backgroundColor = "#FFFFFF"          # fondo principal blanco
+secondaryBackgroundColor = "#F0F4F8" # fondo sidebar y expanders
+textColor = "#1A1A2E"                # texto principal casi negro
+font = "sans serif"
+
+[server]
+maxUploadSize = 50          # MB; archivos Excel de laboratorio son pequeños
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false    # no enviar telemetría
