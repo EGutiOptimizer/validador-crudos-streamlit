@@ -20,7 +20,7 @@ EMOJI = {
 def map_emoji(v: str) -> str:
     return EMOJI.get(str(v), "⚪")
 
-def style_semaforo_column(df: pd.DataFrame, col: str) -> pd.io.formats.style.Styler:
+def style_semaforo_column(df: pd.DataFrame, col: str):
     def colorize(val):
         color = PALETA.get(str(val), "#FFFFFF")
         return f"background-color: {color}; font-weight: 600;"
