@@ -1,6 +1,6 @@
 """
-core/validator_core.py
-======================
+validator_core.py
+=================
 Lógica de negocio pura para validación de crudos RAMS vs ISA.
 
 Sin dependencias de Streamlit — 100% testeable en aislamiento.
@@ -16,7 +16,7 @@ from typing import IO
 
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment  # Border/Side eliminados: no se usan
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from core.models import ValidationResult, ThresholdConfig
@@ -142,9 +142,7 @@ def read_file(file_obj: IO[bytes], filename: str) -> pd.DataFrame:
             f"Use: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
-    # Leer bytes una sola vez y envolver en BytesIO para evitar doble wrapping
-    raw = file_obj.read() if hasattr(file_obj, "read") else bytes(file_obj)
-    data = io.BytesIO(raw)
+    data = io.BytesIO(file_obj.read() if hasattr(file_obj, "read") else file_obj)
 
     if ext == ".csv":
         return _read_csv(data, filename)
@@ -231,6 +229,7 @@ def align_dataframes(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Alinea dos DataFrames por la columna clave (cortes).
 
+    Hace un merge outer para preservar todos los cortes de ISA.
     Los cortes de RAMS sin par ISA se descartan (ISA es la referencia).
 
     Args:
@@ -274,7 +273,7 @@ def compute_errors(
     Args:
         df_isa: DataFrame ISA con cortes y propiedades.
         df_rams: DataFrame RAMS con las mismas propiedades.
-        key_col: Columna que identifica los cortes (ej. 'corte').
+        key_col: Columna que identifica los cortes (ej. 'corte_C').
         prop_cols: Lista de propiedades a comparar. Si None, usa todas
                    las columnas numéricas de ISA excepto key_col.
 
@@ -356,7 +355,7 @@ def classify_matrix(
     for col in error_matrix.columns:
         green, yellow = config.get_thresholds(col)
         result[col] = error_matrix[col].apply(
-            lambda e, g=green, y=yellow: classify_semaforo(e, g, y)
+            lambda e: classify_semaforo(e, green, yellow)
         )
     return result
 
@@ -368,7 +367,7 @@ def build_summary(semaforo_matrices: dict[str, pd.DataFrame]) -> pd.DataFrame:
         semaforo_matrices: Mapa nombre_crudo → DataFrame de semáforos.
 
     Returns:
-        DataFrame con columnas: crudo, verde_%, amarillo_%, rojo_%,
+        DataFrame con columnas: crudo, verde_pct, amarillo_pct, rojo_pct,
         total_celdas, estado_global.
     """
     rows = []
@@ -505,7 +504,7 @@ def _write_summary_sheet(wb: openpyxl.Workbook, result: ValidationResult) -> Non
     for r_idx, row in enumerate(result.summary.itertuples(index=False), start=2):
         for c_idx, val in enumerate(row, start=1):
             cell = ws.cell(r_idx, c_idx, val)
-            # Colorear columna estado_global (valor crudo: 'verde'/'amarillo'/'rojo')
+            # Colorear columna estado_global
             if headers[c_idx - 1] == "estado_global":
                 cell.fill = _semaforo_fill(str(val))
 
@@ -521,14 +520,8 @@ def _write_crudo_sheet(
     ws = wb.create_sheet(sheet_name)
     cols = list(error_df.columns)
 
-    # Cabecera: celda A1 con formato igual al resto de cabeceras
-    header_fill = PatternFill("solid", fgColor="FF1E3A5F")
-    header_font = Font(bold=True, color="FFFFFFFF")
-    cell_corte = ws.cell(1, 1, "corte")
-    cell_corte.fill = header_fill
-    cell_corte.font = header_font
-    cell_corte.alignment = Alignment(horizontal="center")
-
+    # Cabecera
+    ws.cell(1, 1, "corte")
     _write_header_row(ws, cols, row=1, col_offset=1)
 
     for r_idx, (idx_val, err_row) in enumerate(error_df.iterrows(), start=2):

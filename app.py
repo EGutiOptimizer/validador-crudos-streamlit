@@ -22,7 +22,7 @@ from core.validator_core import run_validation, build_excel, read_file
 from ui.styling import render_all_results, render_threshold_editor
 
 # ---------------------------------------------------------------------------
-# Configuración de logging
+# Configuración de logging (no verbose, no exponer datos sensibles)
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -47,22 +47,6 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Helpers de secrets (seguro en local y en Cloud)
-# ---------------------------------------------------------------------------
-
-def _get_secret(section: str, key: str, default: Any) -> Any:
-    """Lee un valor de st.secrets de forma segura.
-
-    Devuelve el default si secrets.toml no existe (ejecución local)
-    o si la clave no está definida.
-    """
-    try:
-        return st.secrets.get(section, {}).get(key, default)
-    except Exception:
-        return default
-
-
-# ---------------------------------------------------------------------------
 # Helpers de session_state
 # ---------------------------------------------------------------------------
 
@@ -78,6 +62,17 @@ def _init_state() -> None:
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+
+def _read_uploaded_files(uploaded_list) -> dict[str, io.BytesIO]:
+    """Convierte lista de UploadedFile a dict nombre → BytesIO."""
+    result = {}
+    for f in uploaded_list:
+        try:
+            result[f.name] = io.BytesIO(f.read())
+        except Exception as e:
+            st.error(f"❌ Error leyendo '{f.name}': {e}")
+    return result
 
 
 @st.cache_data(show_spinner=False)
@@ -96,7 +91,7 @@ def _cached_detect_prop_cols(file_bytes: bytes, filename: str) -> list[str]:
 # Sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> tuple[list, list, str, ThresholdConfig]:
+def render_sidebar() -> tuple[dict, dict, str, ThresholdConfig]:
     """Renderiza el sidebar completo y devuelve configuración de ejecución."""
     with st.sidebar:
         st.title("🛢️ Validador de Crudos")
@@ -145,7 +140,7 @@ def render_sidebar() -> tuple[list, list, str, ThresholdConfig]:
 
         key_col = st.text_input(
             "Columna clave (cortes)",
-            value=_get_secret("defaults", "key_col", "corte"),
+            value=st.secrets.get("defaults", {}).get("key_col", "corte"),
             help="Nombre exacto de la columna que identifica los cortes en los archivos.",
         )
 
@@ -156,7 +151,7 @@ def render_sidebar() -> tuple[list, list, str, ThresholdConfig]:
                 "🟢 Verde ≤",
                 min_value=0.0,
                 max_value=1000.0,
-                value=float(_get_secret("defaults", "umbral_verde", 1.0)),
+                value=float(st.secrets.get("defaults", {}).get("umbral_verde", 1.0)),
                 step=0.1,
                 help="Error máximo para clasificar como verde (OK).",
             )
@@ -165,7 +160,7 @@ def render_sidebar() -> tuple[list, list, str, ThresholdConfig]:
                 "🟡 Amarillo ≤",
                 min_value=0.0,
                 max_value=1000.0,
-                value=float(_get_secret("defaults", "umbral_amarillo", 3.0)),
+                value=float(st.secrets.get("defaults", {}).get("umbral_amarillo", 3.0)),
                 step=0.1,
                 help="Error máximo para clasificar como amarillo (Revisar). Por encima → rojo.",
             )
@@ -234,6 +229,7 @@ def main() -> None:
 
     # --- Ejecución ---
     if run_btn:
+        # Validar umbral antes de ejecutar
         if config.default_green >= config.default_yellow:
             st.error("❌ Corrige los umbrales antes de ejecutar: verde debe ser < amarillo.")
             st.stop()
@@ -244,6 +240,7 @@ def main() -> None:
 
         with st.spinner("⏳ Procesando validación..."):
             try:
+                # Convertir UploadedFiles a BytesIO (sin escribir a disco)
                 isa_dict: dict[str, io.BytesIO] = {}
                 for f in isa_files_raw:
                     f.seek(0)
@@ -290,6 +287,7 @@ def main() -> None:
         result = st.session_state.result
         render_all_results(result)
 
+        # Botón de descarga Excel
         if st.session_state.excel_bytes:
             st.divider()
             st.download_button(
