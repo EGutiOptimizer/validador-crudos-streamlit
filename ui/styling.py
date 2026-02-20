@@ -12,7 +12,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from core.models import ValidationResult, ThresholdConfig
+from core.models import ValidationResult  # ThresholdConfig no se usa aquí: eliminado
 from core.validator_core import SEMAFORO_LABELS
 
 # ---------------------------------------------------------------------------
@@ -26,9 +26,30 @@ SEMAFORO_CSS = {
 }
 
 
-def _cell_color(val: str) -> str:
-    """Devuelve estilo CSS para una celda según su valor de semáforo."""
-    return SEMAFORO_CSS.get(str(val).lower(), "")
+# ---------------------------------------------------------------------------
+# Helpers de color (internos)
+# ---------------------------------------------------------------------------
+
+def _color_for_semaforo_label(val: str) -> str:
+    """Devuelve CSS para una celda dado su label con emoji (ej. '🟢 OK').
+
+    Compatible con pandas >= 2.1 (usa .map en lugar del deprecado .applymap).
+    """
+    for key, label in SEMAFORO_LABELS.items():
+        if val == label:
+            return SEMAFORO_CSS.get(key, "")
+    return ""
+
+
+def _color_for_semaforo_key(val: str) -> str:
+    """Devuelve CSS para una celda dado su valor clave (ej. 'verde').
+
+    Usado en render_summary donde la columna estado_global contiene labels con emoji.
+    """
+    for key, label in SEMAFORO_LABELS.items():
+        if val == label:
+            return SEMAFORO_CSS.get(key, "")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -70,18 +91,13 @@ def render_summary(result: ValidationResult) -> None:
     st.subheader("📊 Resumen Global por Crudo")
 
     display = result.summary.copy()
+    # Mapear valor crudo ('verde') → label con emoji ('🟢 OK')
     display["estado_global"] = display["estado_global"].map(
         lambda v: SEMAFORO_LABELS.get(v, v)
     )
 
-    # Aplicar colores a columna de estado
-    def color_estado(val: str) -> str:
-        for key, label in SEMAFORO_LABELS.items():
-            if val == label:
-                return SEMAFORO_CSS.get(key, "")
-        return ""
-
-    styled = display.style.applymap(color_estado, subset=["estado_global"])
+    # .map() es el nombre correcto en pandas >= 2.1 (applymap fue eliminado en 3.x)
+    styled = display.style.map(_color_for_semaforo_key, subset=["estado_global"])
     st.dataframe(styled, use_container_width=True)
 
 
@@ -103,27 +119,25 @@ def render_crudo_detail(
 
 def _render_semaforo_table(semaforo_df: pd.DataFrame) -> None:
     """Renderiza tabla de semáforo con colores de celda."""
-    display = semaforo_df.copy().reset_index()
-    display = display.rename(columns={"index": "corte"})
+    prop_cols = list(semaforo_df.columns)
 
-    # Mapear a etiquetas con emoji
-    for col in semaforo_df.columns:
+    display = semaforo_df.copy().reset_index()
+    # reset_index() convierte el índice (que tiene nombre = key_col) en columna;
+    # no hace falta rename porque el nombre ya es correcto.
+
+    # Mapear claves internas a labels con emoji solo en columnas de propiedades
+    for col in prop_cols:
         display[col] = display[col].map(lambda v: SEMAFORO_LABELS.get(v, v))
 
-    def color_semaforo_cell(val: str) -> str:
-        for key, label in SEMAFORO_LABELS.items():
-            if val == label:
-                return SEMAFORO_CSS.get(key, "")
-        return ""
-
-    styled = display.style.applymap(color_semaforo_cell, subset=list(semaforo_df.columns))
+    # .map() compatible con pandas >= 2.1
+    styled = display.style.map(_color_for_semaforo_label, subset=prop_cols)
     st.dataframe(styled, use_container_width=True)
 
 
 def _render_error_table(error_df: pd.DataFrame) -> None:
     """Renderiza tabla de errores absolutos con gradiente de color."""
     display = error_df.copy().reset_index()
-    display = display.rename(columns={"index": "corte"})
+    # reset_index() convierte el índice en columna con su nombre original
 
     numeric_cols = [c for c in error_df.columns if pd.api.types.is_numeric_dtype(error_df[c])]
 

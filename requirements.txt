@@ -1,17 +1,4 @@
-# Validador de Crudos RAMS/ISA — dependencias para Streamlit Cloud
-# Rangos de versión: mínimo probado en Cloud, sin pinear exacto para compatibilidad.
-
-# Runtime Streamlit
-streamlit>=1.32.0,<2.0.0
-
-# Data
-pandas>=2.0.0,<3.0.0
-numpy>=1.26.0,<2.0.0
-
-# Excel
-openpyxl>=3.1.0,<4.0.0   # .xlsx (lectura y escritura con estilos)
-xlrd>=2.0.1,<3.0.0        # .xls (solo lectura, NO usar para .xlsx)
-# pyxlsb>=1.0.9           # descomentarr si se necesitan archivos .xlsb
-
-# Tests (no requerido en Cloud, ignorado por Streamlit)
-pytest>=7.0.0
+streamlit>=1.32.0
+pandas>=2.1.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
