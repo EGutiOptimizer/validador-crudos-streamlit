@@ -262,4 +262,3 @@ def render_all_results(result: ValidationResult) -> None:
         df_out = result.crudo_dataframes.get(name, pd.DataFrame())
         cortes = result.cortes_visibles.get(name, [])
         render_crudo_detail(name, df_out, cortes)
-        
