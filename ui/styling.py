@@ -161,20 +161,44 @@ def _render_semaforo_tab(df_out: pd.DataFrame) -> None:
 
 
 def _render_errores_tab(df_out: pd.DataFrame, cortes_visibles: list[str]) -> None:
-    """Muestra errores numéricos por corte con gradiente de color."""
+    """Muestra errores numéricos por corte. Colorea celdas según el semáforo de cada fila."""
     corte_cols_present = [c for c in cortes_visibles if c in df_out.columns]
     prop_col = ["Propiedad"] if "Propiedad" in df_out.columns else []
     display_cols = prop_col + corte_cols_present
     display = df_out[display_cols].copy()
 
-    if corte_cols_present:
-        styled = (
-            display.style
-            .background_gradient(subset=corte_cols_present, cmap="RdYlGn_r", vmin=0)
-            .format({c: "{:.4f}" for c in corte_cols_present}, na_rep="N/D")
-        )
-    else:
-        styled = display.style
+    if not corte_cols_present:
+        st.dataframe(display, use_container_width=True)
+        return
+
+    # Colorea cada celda numérica según el semáforo de esa fila (sin matplotlib)
+    sem_col = df_out["Semaforo"] if "Semaforo" in df_out.columns else None
+
+    def _color_row(row: pd.Series) -> list[str]:
+        """Asigna color de fondo a cada celda según el semáforo de la fila."""
+        # Localizar el semáforo de esta fila por índice posicional
+        sem = ""
+        if sem_col is not None:
+            try:
+                sem = str(sem_col.iloc[row.name] if hasattr(row, "name") else "").upper()
+            except Exception:
+                sem = ""
+        bg = SEMAFORO_CSS.get(sem, "")
+        # Solo colorear columnas de corte, dejar Propiedad sin color
+        styles = []
+        for col in row.index:
+            if col in corte_cols_present and pd.notna(row[col]):
+                styles.append(bg)
+            else:
+                styles.append("")
+        return styles
+
+    styled = (
+        display.reset_index(drop=True)
+        .style
+        .apply(_color_row, axis=1)
+        .format({c: "{:.4f}" for c in corte_cols_present}, na_rep="N/D")
+    )
 
     st.dataframe(styled, use_container_width=True)
 
