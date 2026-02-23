@@ -74,14 +74,46 @@ def strip_accents(text: str) -> str:
     )
 
 
-def canon_prop(s: str, alias: Optional[Dict[str, str]] = None) -> str:
-    """Canoniza nombres de propiedad y aplica alias."""
+def _canon_prop_norm(s: str) -> str:
+    """
+    Normalización interna robusta para nombres de propiedad.
+    Elimina acentos, paréntesis, %, /, convierte coma a espacio y colapsa
+    espacios múltiples. Usada tanto en canon_prop como en crear_semantica_alias
+    para garantizar que claves del diccionario y valores entrantes pasen por
+    exactamente el mismo proceso.
+
+    Ejemplos:
+        "PIONA (%vol), N-Parafinas"  -> "PIONA VOL N-PARAFINAS"
+        "PIONA (% vol),N-Parafinas"  -> "PIONA VOL N-PARAFINAS"
+        "PIONA(%vol),N-Parafinas"    -> "PIONA VOL N-PARAFINAS"
+        "Piona (%VOL) N-Parafinas"   -> "PIONA VOL N-PARAFINAS"
+        "Densidad a 15°C"            -> "DENSIDAD A 15C"
+        "Carbono Conradson"          -> "CARBONO CONRADSON"
+        "NOR Claro"                  -> "NOR CLARO"
+    """
     if s is None:
         return ""
     t = strip_accents(str(s)).upper().strip()
+    # Eliminar caracteres de grado y punto (no son separadores de palabras)
     for ch in [".", "º", "°"]:
         t = t.replace(ch, "")
-    t = re.sub(r"\s+", " ", t)
+    # Sustituir paréntesis y % por espacio (fuente principal de variantes en PIONA)
+    for ch in ["(", ")", "%", "/"]:
+        t = t.replace(ch, " ")
+    # Normalizar coma con o sin espacios -> espacio simple
+    t = re.sub(r"\s*,\s*", " ", t)
+    # Colapsar espacios múltiples
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def canon_prop(s: str, alias: Optional[Dict[str, str]] = None) -> str:
+    """Canoniza nombres de propiedad y aplica alias.
+
+    Usa _canon_prop_norm internamente para tolerancia máxima a variantes:
+    paréntesis, porcentajes, comas, acentos, mayúsculas, grados.
+    """
+    t = _canon_prop_norm(s)
     if not re.search(r"[A-Z0-9]", t):
         return ""
     if alias:
@@ -193,79 +225,197 @@ def construir_umbrales(
 # ---------------------------------------------------------------------------
 
 def crear_semantica_alias() -> Dict[str, str]:
-    """Devuelve diccionario de alias normalizados de propiedades."""
-    raw = {
-        "PESO": "PESO",
-        "PESO ACUMULADO": "PESO ACUMULADO",
-        "DENSIDAD": "DENSIDAD",
-        "DENSIDAD A 15C": "DENSIDAD",
-        "DENSIDAD A 15": "DENSIDAD",
-        "DENSIDAD 15C": "DENSIDAD",
-        "VISCOSIDAD 50": "VISCOSIDAD 50",
-        "VISCOSIDAD 50C": "VISCOSIDAD 50",
-        "VISCOSIDAD A 50C": "VISCOSIDAD 50",
-        "VISCOSIDAD 100": "VISCOSIDAD 100",
-        "VISCOSIDAD 100C": "VISCOSIDAD 100",
-        "VISCOSIDAD A 100C": "VISCOSIDAD 100",
-        "AZUFRE": "AZUFRE",
-        "AZUFRE MERCAPTANO": "AZUFRE MERCAPTANO",
-        "RON": "RON", "NOR": "RON", "NOR CLARO": "RON", "N O R CLARO": "RON",
-        "MON": "MON", "NOM": "MON", "NOM CLARO": "MON", "N O M CLARO": "MON",
-        "N DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "NUMERO DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "NO DE NEUTRALIZACION": "N DE NEUTRALIZACION",
-        "INDICE DE REFRACCION 70C": "INDICE DE REFRACCION 70C",
-        "PUNTO DE VERTIDO": "PUNTO DE VERTIDO",
-        "PUNTO DE NIEBLA": "PUNTO DE NIEBLA",
-        "PUNTO DE CRISTALIZACION": "PUNTO DE CRISTALIZACION",
-        "PUNTO DE ANILINA": "PUNTO DE ANILINA",
-        "PIONA (%VOL), N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA (%VOL), I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA (%VOL), NAFTENOS": "PIONA NAFTENOS",
-        "PIONA (%VOL), POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA (%VOL), AROMATICOS": "PIONA AROMATICOS",
-        "PIONA (%VOL), SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "PIONA N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA NAFTENOS": "PIONA NAFTENOS",
-        "PIONA POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA AROMATICOS": "PIONA AROMATICOS",
-        "PIONA SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "PIONA, N-PARAFINAS": "PIONA N-PARAFINAS",
-        "PIONA, I-PARAFINAS": "PIONA I-PARAFINAS",
-        "PIONA, NAFTENOS": "PIONA NAFTENOS",
-        "PIONA, POLINAFTENOS": "PIONA POLINAFTENOS",
-        "PIONA, AROMATICOS": "PIONA AROMATICOS",
-        "PIONA, SUPERIORES A 200C": "PIONA SUPERIORES A 200C",
-        "NITROGENO": "NITROGENO",
-        "NITROGENO BASICO": "NITROGENO BASICO",
-        "RESIDUO DE CARBON": "RESIDUO DE CARBON",
-        "CARBONO CONRADSON": "RESIDUO DE CARBON",
-        "ASFALTENOS": "ASFALTENOS",
-        "MONOAROMATICOS": "MONOAROMATICOS",
-        "DIAROMATICOS": "DIAROMATICOS",
-        "TRIAROMATICOS Y SUPERIORES": "TRIAROMATICOS",
-        "CONTENIDO EN C2": "CONTENIDO EN C2",
-        "CONTENIDO EN C3": "CONTENIDO EN C3",
-        "CONTENIDO EN IC4": "CONTENIDO EN IC4",
-        "CONTENIDO EN NC4": "CONTENIDO EN NC4",
-        "NIQUEL": "NIQUEL",
-        "VANADIO": "VANADIO",
-        "SILICIO": "SILICIO",
+    """
+    Devuelve diccionario de alias normalizados para nombres de propiedad.
+
+    Las claves y valores se generan con _canon_prop_norm, que es exactamente
+    la misma función que usa canon_prop al buscar. Esto garantiza que cualquier
+    variante que pase por canon_prop encuentre su alias, independientemente de
+    paréntesis, %, comas, espacios extras, acentos o capitalización.
+
+    Cobertura PIONA:
+        Cualquier combinación de:
+          - "PIONA (%vol), X"  /  "PIONA(%vol),X"  /  "PIONA (% vol) X"
+          - "PIONA X"          /  "PIONA, X"
+          - solo "X" (sin prefijo PIONA)
+        para X en: N-Parafinas, I-Parafinas, Naftenos, Polinaftenos,
+                   Aromaticos, Olefinas, Superiores a 200C
+    """
+    # Todas las claves en formato legible; _norm las normaliza automáticamente
+    raw: Dict[str, str] = {
+        # ── Peso ─────────────────────────────────────────────────────────────
+        "PESO":                             "PESO",
+        "PESO ACUMULADO":                   "PESO ACUMULADO",
+        "RENDIMIENTO":                      "PESO",
+        "RENDIMIENTO ACUMULADO":            "PESO ACUMULADO",
+        "% DESTILADO":                      "PESO",
+        "% VOL":                            "PESO",
+        "% EN PESO":                        "PESO",
+
+        # ── Densidad ─────────────────────────────────────────────────────────
+        "DENSIDAD":                         "DENSIDAD",
+        "DENSIDAD A 15C":                   "DENSIDAD",
+        "DENSIDAD A 15":                    "DENSIDAD",
+        "DENSIDAD 15C":                     "DENSIDAD",
+        "DENSIDAD RELATIVA":                "DENSIDAD",
+        "DENSIDAD RELATIVA 15/4":           "DENSIDAD",
+        "DENSIDAD A 15/4":                  "DENSIDAD",
+        "D15":                              "DENSIDAD",
+        "GRAVEDAD ESPECIFICA":              "DENSIDAD",
+
+        # ── Viscosidad ───────────────────────────────────────────────────────
+        "VISCOSIDAD 50":                    "VISCOSIDAD 50",
+        "VISCOSIDAD 50C":                   "VISCOSIDAD 50",
+        "VISCOSIDAD A 50C":                 "VISCOSIDAD 50",
+        "VISCOSIDAD CINEMATICA 50":         "VISCOSIDAD 50",
+        "VISCOSIDAD CINEMATICA 50C":        "VISCOSIDAD 50",
+        "VISCOSIDAD DINAMICA 50":           "VISCOSIDAD 50",
+        "VISCOSIDAD DINAMICA 50C":          "VISCOSIDAD 50",
+        "VIS 50":                           "VISCOSIDAD 50",
+        "VISCOSIDAD 100":                   "VISCOSIDAD 100",
+        "VISCOSIDAD 100C":                  "VISCOSIDAD 100",
+        "VISCOSIDAD A 100C":                "VISCOSIDAD 100",
+        "VISCOSIDAD CINEMATICA 100":        "VISCOSIDAD 100",
+        "VISCOSIDAD CINEMATICA 100C":       "VISCOSIDAD 100",
+        "VIS 100":                          "VISCOSIDAD 100",
+
+        # ── Azufre ───────────────────────────────────────────────────────────
+        "AZUFRE":                           "AZUFRE",
+        "AZUFRE TOTAL":                     "AZUFRE",
+        "AZUFRE MERCAPTANO":                "AZUFRE MERCAPTANO",
+        "S MERCAPTANO":                     "AZUFRE MERCAPTANO",
+
+        # ── Octanaje ─────────────────────────────────────────────────────────
+        "RON":                              "RON",
+        "NOR":                              "RON",
+        "NOR CLARO":                        "RON",
+        "N O R CLARO":                      "RON",
+        "NUMERO DE OCTANO INVESTIGACION":   "RON",
+        "MON":                              "MON",
+        "NOM":                              "MON",
+        "NOM CLARO":                        "MON",
+        "N O M CLARO":                      "MON",
+        "NUMERO DE OCTANO MOTOR":           "MON",
+
+        # ── Índice de neutralización ─────────────────────────────────────────
+        "N DE NEUTRALIZACION":              "N DE NEUTRALIZACION",
+        "NUMERO DE NEUTRALIZACION":         "N DE NEUTRALIZACION",
+        "NO DE NEUTRALIZACION":             "N DE NEUTRALIZACION",
+        "INDICE DE ACIDEZ":                 "N DE NEUTRALIZACION",
+
+        # ── Índice de refracción ─────────────────────────────────────────────
+        "INDICE DE REFRACCION 70C":         "INDICE DE REFRACCION 70C",
+        "INDICE DE REFRACCION":             "INDICE DE REFRACCION 70C",
+        "IR 70C":                           "INDICE DE REFRACCION 70C",
+
+        # ── Puntos físicos ───────────────────────────────────────────────────
+        "PUNTO DE VERTIDO":                 "PUNTO DE VERTIDO",
+        "PUNTO DE NIEBLA":                  "PUNTO DE NIEBLA",
+        "PUNTO DE CRISTALIZACION":          "PUNTO DE CRISTALIZACION",
+        "PUNTO DE ANILINA":                 "PUNTO DE ANILINA",
+        "PUNTO DE INFLAMACION":             "PUNTO DE INFLAMACION",
+        "PUNTO INICIAL DE EBULLICION":      "PUNTO INICIAL DE EBULLICION",
+        "PIE":                              "PUNTO INICIAL DE EBULLICION",
+        "IBP":                              "PUNTO INICIAL DE EBULLICION",
+        "PUNTO FINAL DE EBULLICION":        "PUNTO FINAL DE EBULLICION",
+        "PFE":                              "PUNTO FINAL DE EBULLICION",
+        "FBP":                              "PUNTO FINAL DE EBULLICION",
+
+        # ── PIONA — con prefijo "PIONA (%VOL)," (cualquier espaciado/coma) ──
+        # La normalización de _canon_prop_norm convierte "PIONA (%VOL), X"
+        # en "PIONA VOL X", igual que "PIONA (% vol),X" o "PIONA(%vol) X".
+        "PIONA (%VOL), N-PARAFINAS":        "PIONA N-PARAFINAS",
+        "PIONA (%VOL), I-PARAFINAS":        "PIONA I-PARAFINAS",
+        "PIONA (%VOL), NAFTENOS":           "PIONA NAFTENOS",
+        "PIONA (%VOL), POLINAFTENOS":       "PIONA POLINAFTENOS",
+        "PIONA (%VOL), AROMATICOS":         "PIONA AROMATICOS",
+        "PIONA (%VOL), OLEFINAS":           "PIONA OLEFINAS",
+        "PIONA (%VOL), SUPERIORES A 200C":  "PIONA SUPERIORES A 200C",
+        "PIONA (%VOL) N-PARAFINAS":         "PIONA N-PARAFINAS",   # sin coma
+        "PIONA (%VOL) I-PARAFINAS":         "PIONA I-PARAFINAS",
+        "PIONA (%VOL) NAFTENOS":            "PIONA NAFTENOS",
+        "PIONA (%VOL) POLINAFTENOS":        "PIONA POLINAFTENOS",
+        "PIONA (%VOL) AROMATICOS":          "PIONA AROMATICOS",
+        "PIONA (%VOL) OLEFINAS":            "PIONA OLEFINAS",
+        "PIONA (%VOL) SUPERIORES A 200C":   "PIONA SUPERIORES A 200C",
+
+        # ── PIONA — con prefijo "PIONA," o "PIONA " ──────────────────────────
+        "PIONA N-PARAFINAS":                "PIONA N-PARAFINAS",
+        "PIONA I-PARAFINAS":                "PIONA I-PARAFINAS",
+        "PIONA NAFTENOS":                   "PIONA NAFTENOS",
+        "PIONA POLINAFTENOS":               "PIONA POLINAFTENOS",
+        "PIONA AROMATICOS":                 "PIONA AROMATICOS",
+        "PIONA OLEFINAS":                   "PIONA OLEFINAS",
+        "PIONA SUPERIORES A 200C":          "PIONA SUPERIORES A 200C",
+        "PIONA, N-PARAFINAS":               "PIONA N-PARAFINAS",
+        "PIONA, I-PARAFINAS":               "PIONA I-PARAFINAS",
+        "PIONA, NAFTENOS":                  "PIONA NAFTENOS",
+        "PIONA, POLINAFTENOS":              "PIONA POLINAFTENOS",
+        "PIONA, AROMATICOS":                "PIONA AROMATICOS",
+        "PIONA, OLEFINAS":                  "PIONA OLEFINAS",
+        "PIONA, SUPERIORES A 200C":         "PIONA SUPERIORES A 200C",
+
+        # ── PIONA — sin prefijo PIONA (solo el componente) ───────────────────
+        "N-PARAFINAS":                      "PIONA N-PARAFINAS",
+        "PARAFINAS NORMALES":               "PIONA N-PARAFINAS",
+        "N PARAFINAS":                      "PIONA N-PARAFINAS",
+        "I-PARAFINAS":                      "PIONA I-PARAFINAS",
+        "ISOPARAFINAS":                     "PIONA I-PARAFINAS",
+        "I PARAFINAS":                      "PIONA I-PARAFINAS",
+        "NAFTENOS":                         "PIONA NAFTENOS",
+        "NAFTENICOS":                       "PIONA NAFTENOS",
+        "POLINAFTENOS":                     "PIONA POLINAFTENOS",
+        "AROMATICOS":                       "PIONA AROMATICOS",
+        "AROMATICS":                        "PIONA AROMATICOS",
+        "OLEFINAS":                         "PIONA OLEFINAS",
+        "SUPERIORES A 200C":                "PIONA SUPERIORES A 200C",
+
+        # ── Nitrógeno ────────────────────────────────────────────────────────
+        "NITROGENO":                        "NITROGENO",
+        "NITROGENO TOTAL":                  "NITROGENO",
+        "NITROGENO BASICO":                 "NITROGENO BASICO",
+
+        # ── Residuo de carbono ───────────────────────────────────────────────
+        "RESIDUO DE CARBON":                "RESIDUO DE CARBON",
+        "CARBONO CONRADSON":                "RESIDUO DE CARBON",
+        "CONRADSON":                        "RESIDUO DE CARBON",
+        "CCR":                              "RESIDUO DE CARBON",
+        "MCRT":                             "RESIDUO DE CARBON",
+
+        # ── Asfaltenos y aromáticos ──────────────────────────────────────────
+        "ASFALTENOS":                       "ASFALTENOS",
+        "MONOAROMATICOS":                   "MONOAROMATICOS",
+        "DIAROMATICOS":                     "DIAROMATICOS",
+        "TRIAROMATICOS Y SUPERIORES":       "TRIAROMATICOS",
+        "TRIAROMATICOS":                    "TRIAROMATICOS",
+
+        # ── Gases ligeros ─────────────────────────────────────────────────────
+        "CONTENIDO EN C2":                  "CONTENIDO EN C2",
+        "C2":                               "CONTENIDO EN C2",
+        "CONTENIDO EN C3":                  "CONTENIDO EN C3",
+        "C3":                               "CONTENIDO EN C3",
+        "CONTENIDO EN IC4":                 "CONTENIDO EN IC4",
+        "IC4":                              "CONTENIDO EN IC4",
+        "CONTENIDO EN NC4":                 "CONTENIDO EN NC4",
+        "NC4":                              "CONTENIDO EN NC4",
+
+        # ── Metales ──────────────────────────────────────────────────────────
+        "NIQUEL":                           "NIQUEL",
+        "NI":                               "NIQUEL",
+        "VANADIO":                          "VANADIO",
+        "V":                                "VANADIO",
+        "SILICIO":                          "SILICIO",
+        "SI":                               "SILICIO",
     }
 
-    def _norm(s: str) -> str:
-        if s is None:
-            return ""
-        t = strip_accents(str(s)).upper().strip()
-        for ch in [".", "º", "°"]:
-            t = t.replace(ch, "")
-        t = re.sub(r"\s+", " ", t)
-        return t
-
+    # Usar _canon_prop_norm (idéntica a la usada en canon_prop) para construir
+    # las claves del diccionario — garantiza match perfecto con lo que llegue
     out: Dict[str, str] = {}
     for k, v in raw.items():
-        out[_norm(k)] = _norm(v)
+        nk = _canon_prop_norm(k)
+        nv = _canon_prop_norm(v)
+        if nk:
+            out[nk] = nv
     return out
 
 

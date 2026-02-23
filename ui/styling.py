@@ -7,10 +7,14 @@ Renderiza resultados del pipeline con paridad visual al MVP:
   - Tabla Resumen (Propiedad × crudos) con colores de semáforo y fila GLOBAL
   - Detalle por crudo: tabla completa con columnas Semaforo + cortes numéricos
   - Colores idénticos al Excel del MVP: C6EFCE / FFEB9C / FFC7CE / E7E6E6
+  - Botones de descarga CSV explícitos (no dependen del icono nativo del dataframe)
 
 Sin lógica de negocio — solo presentación de datos ya calculados por core/.
 """
 from __future__ import annotations
+
+import io
+import re
 
 import pandas as pd
 import streamlit as st
@@ -39,6 +43,11 @@ SEMAFORO_EMOJI: dict[str, str] = {
 
 def _cell_sem_css(val: str) -> str:
     return SEMAFORO_CSS.get(str(val).strip().upper(), "")
+
+
+def _df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serializa un DataFrame a CSV en UTF-8 con BOM (compatible con Excel español)."""
+    return df.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +117,15 @@ def render_summary(result: ValidationResult) -> None:
 
     st.dataframe(styled, use_container_width=True, height=min(600, 38 * len(display) + 40))
 
+    # Botón de descarga CSV del resumen (usa el DataFrame original sin emojis)
+    st.download_button(
+        label="⬇️ Descargar Resumen CSV",
+        data=_df_to_csv_bytes(result.summary),
+        file_name="resumen_validacion.csv",
+        mime="text/csv",
+        key="dl_resumen_csv",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Detalle por crudo
@@ -121,16 +139,38 @@ def render_crudo_detail(
     """
     Renderiza el detalle de un crudo con:
     Tab 1: Semáforo — columnas Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor
-    Tab 2: Errores  — columnas Propiedad | [cortes numéricos con gradiente]
+    Tab 2: Errores  — columnas Propiedad | [cortes numéricos con colores]
+    Botones de descarga CSV debajo de cada tab.
     """
+    # Nombre seguro para usar en claves Streamlit y nombres de archivo
+    safe_name = re.sub(r"[^A-Za-z0-9_\-]", "_", crude_name)
+
     with st.expander(f"🛢️ Crudo: **{crude_name}**", expanded=False):
         tab_sem, tab_err = st.tabs(["🚦 Semáforo", "📐 Errores Absolutos"])
 
         with tab_sem:
             _render_semaforo_tab(df_out)
+            # CSV de la vista semáforo (columnas de clasificación)
+            sem_cols = ["Propiedad", "Semaforo", "Corte_peor", "Error_peor", "Umbral_peor"]
+            sem_cols_present = [c for c in sem_cols if c in df_out.columns]
+            st.download_button(
+                label="⬇️ Descargar Semáforo CSV",
+                data=_df_to_csv_bytes(df_out[sem_cols_present]),
+                file_name=f"semaforo_{safe_name}.csv",
+                mime="text/csv",
+                key=f"dl_sem_{safe_name}",
+            )
 
         with tab_err:
             _render_errores_tab(df_out, cortes_visibles)
+            # CSV de errores absolutos completo (todas las columnas)
+            st.download_button(
+                label="⬇️ Descargar Errores CSV",
+                data=_df_to_csv_bytes(df_out),
+                file_name=f"errores_{safe_name}.csv",
+                mime="text/csv",
+                key=f"dl_err_{safe_name}",
+            )
 
 
 def _render_semaforo_tab(df_out: pd.DataFrame) -> None:
@@ -222,3 +262,4 @@ def render_all_results(result: ValidationResult) -> None:
         df_out = result.crudo_dataframes.get(name, pd.DataFrame())
         cortes = result.cortes_visibles.get(name, [])
         render_crudo_detail(name, df_out, cortes)
+        
