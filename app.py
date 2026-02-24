@@ -121,7 +121,7 @@ def render_sidebar():
             "Selecciona archivos ISA",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
-            help="Archivos de predicciones ISA. Soporta .xlsx, .xls, .csv",
+            help="Archivos de predicciones ISA a validar.",
             key="uploader_isa",
         )
         if isa_uploaded:
@@ -135,7 +135,7 @@ def render_sidebar():
             "Selecciona archivos RAMS",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
-            help="Archivos de referencia RAMS a validar.",
+            help="Archivos de referencia RAMS.",
             key="uploader_rams",
         )
         if rams_uploaded:
