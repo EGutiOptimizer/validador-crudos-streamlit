@@ -779,10 +779,10 @@ def calcular_errores_crudo_df(
     tol: float = DEFAULT_TOL,
     tol_pesados: float = DEFAULT_TOL_PESADOS,
 ) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """
+   """
     Calcula errores y semáforos para un par ISA/RAMS.
     Devuelve (df_out, columnas_cortes_visibles, orden_props_local).
-    df_out: Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor | [cortes...]
+    df_out tiene columnas: Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor | [cortes...]
     """
     if "Propiedad" not in df_isa.columns:
         raise ValueError("El archivo ISA no tiene columna 'Propiedad'.")
@@ -805,7 +805,7 @@ def calcular_errores_crudo_df(
     orden_props_local: List[str] = []
 
     for _, row_isa in df_isa.iterrows():
-        prop_raw   = row_isa.get("Propiedad")
+        prop_raw = row_isa.get("Propiedad")
         prop_canon = canon_prop(prop_raw, alias_prop)
         if not prop_canon:
             continue
@@ -825,56 +825,36 @@ def calcular_errores_crudo_df(
             if col_rams is None:
                 fila_out[cname_isa] = None
                 continue
-            isa_val  = _float_or_none(row_isa.get(cname_isa))
+            isa_val = _float_or_none(row_isa.get(cname_isa))
             rams_val = _float_or_none(row_rams.get(col_rams))
             if isa_val is None or rams_val is None:
                 err = None
             else:
                 err = abs(isa_val - rams_val)
             errores_fila[cc_isa] = err
-            fila_out[cname_isa]  = err
+            fila_out[cname_isa] = err
 
         sem, _estados, corte_peor, error_peor, _ratio, umbral_peor = clasificar_propiedad(
             errores_fila,
             prop_canon,
             umbrales,
+            tol=tol,
             pct_ok_amarillo=pct_ok_amarillo,
             pct_rojo_rojo=pct_rojo_rojo,
+            tol_pesados=tol_pesados,
         )
 
-        fila_out["Semaforo"]    = sem
-        fila_out["Corte_peor"]  = corte_peor
-        fila_out["Error_peor"]  = error_peor
-        fila_out["Umbral_peor"] = umbral_peor   # REPRO del corte más crítico
+        fila_out["Semaforo"] = sem
+        fila_out["Corte_peor"] = corte_peor
+        fila_out["Error_peor"] = error_peor
+        fila_out["Umbral_peor"] = umbral_peor
 
+        # Resumen global (propiedad × crudo)
         hoja_resumen.setdefault(prop_canon, {})[crude_name] = sem
+
         df_out.loc[len(df_out)] = fila_out
 
     return df_out, columnas_cortes_visibles, orden_props_local
-
-
-# ---------------------------------------------------------------------------
-# 11. Validación de configuración
-# ---------------------------------------------------------------------------
-
-def validate_params(
-    tol: float = DEFAULT_TOL,
-    tol_pesados: float = DEFAULT_TOL_PESADOS,
-    pct_ok_amarillo: float = DEFAULT_PCT_OK_AMARILLO,
-    pct_rojo_rojo: float = DEFAULT_PCT_ROJO_ROJO,
-) -> None:
-    """
-    Valida parámetros del pipeline.
-    tol / tol_pesados se mantienen en la firma por compatibilidad;
-    ya no se usan en la clasificación por corte.
-    """
-    for name, v in [("tolerancia", tol), ("tol_pesados", tol_pesados)]:
-        if v < 0:
-            raise ValueError(f"'{name}' no puede ser negativo (recibido: {v}).")
-    for name, v in [("pct_ok_amarillo", pct_ok_amarillo), ("pct_rojo_rojo", pct_rojo_rojo)]:
-        if not (0.0 <= v <= 1.0):
-            raise ValueError(f"'{name}' debe estar en [0,1] (recibido: {v}).")
-
 
 # ---------------------------------------------------------------------------
 # 12. Pipeline completo

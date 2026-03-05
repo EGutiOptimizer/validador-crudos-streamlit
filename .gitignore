@@ -1,0 +1,31 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+ISAValidation.venv/
+*/.venv/
+*/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# Config local
+*.env
+.env.*
+!.env.example
+
+# VS Code
+.vscode/*.log
+.vscode/*.cache
+.vscode/settings.json
+
+# Datos/artefactos
+*.log
+*.sqlite3
+dist/
+build/
+*.egg-info/
