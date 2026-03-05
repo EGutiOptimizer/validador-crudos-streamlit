@@ -3,13 +3,16 @@ core/validator_core.py
 ======================
 Lógica de negocio pura para validación de crudos RAMS vs ISA.
 
-PARIDAD TOTAL con validador_crudos.py (MVP CLI):
-  - Usa la misma matriz de umbrales (archivo separado subido por el usuario)
-  - Misma lógica canon_prop / canon_corte / es_corte_pesado / clasificar_propiedad
-  - Mismo pipeline: leer umbrales → emparejar → calcular → exportar
-  - Misma estructura Excel: Resumen (fila GLOBAL + propiedades×crudos) + hojas por crudo
-  - Formato condicional de semáforo idéntico al MVP
-  - Sin imports de Streamlit — 100 % testeable en aislamiento.
+Clasificación por corte (lógica REPRO/ADMISIBLE):
+  - error < REPRO              → 🟢 VERDE
+  - REPRO ≤ error < ADMISIBLE  → 🟡 AMARILLO
+  - error ≥ ADMISIBLE          → 🔴 ROJO
+  - Solo REPRO (sin ADMISIBLE) → < REPRO: VERDE  / ≥ REPRO: ROJO
+  - Solo ADMISIBLE (sin REPRO) → < ADMISIBLE: AMARILLO / ≥ ADMISIBLE: ROJO
+  - Sin ninguno                → (sin umbral)
+
+Agregación global por propiedad y crudo: sin cambios respecto al MVP.
+Sin imports de Streamlit — 100 % testeable en aislamiento.
 """
 from __future__ import annotations
 
@@ -43,7 +46,6 @@ SEMAFORO_COLORS = {
     "NA":       "E7E6E6",
 }
 
-# Etiquetas para UI (con emoji)
 SEMAFORO_LABELS = {
     "VERDE":    "🟢 OK",
     "AMARILLO": "🟡 Revisar",
@@ -53,15 +55,14 @@ SEMAFORO_LABELS = {
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 
-# Defaults del pipeline (mismos que el MVP)
-DEFAULT_TOL            = 0.10   # tolerancia estándar
-DEFAULT_TOL_PESADOS    = 0.60   # tolerancia cortes pesados
-DEFAULT_PCT_OK_AMARILLO = 0.90  # % mínimo verdes para VERDE global
-DEFAULT_PCT_ROJO_ROJO  = 0.30   # % máximo rojos para ROJO global
+DEFAULT_TOL             = 0.10
+DEFAULT_TOL_PESADOS     = 0.60
+DEFAULT_PCT_OK_AMARILLO = 0.90
+DEFAULT_PCT_ROJO_ROJO   = 0.30
 
 
 # ---------------------------------------------------------------------------
-# 1. Normalización de texto  (IDÉNTICA al MVP)
+# 1. Normalización de texto
 # ---------------------------------------------------------------------------
 
 def strip_accents(text: str) -> str:
@@ -75,44 +76,21 @@ def strip_accents(text: str) -> str:
 
 
 def _canon_prop_norm(s: str) -> str:
-    """
-    Normalización interna robusta para nombres de propiedad.
-    Elimina acentos, paréntesis, %, /, convierte coma a espacio y colapsa
-    espacios múltiples. Usada tanto en canon_prop como en crear_semantica_alias
-    para garantizar que claves del diccionario y valores entrantes pasen por
-    exactamente el mismo proceso.
-
-    Ejemplos:
-        "PIONA (%vol), N-Parafinas"  -> "PIONA VOL N-PARAFINAS"
-        "PIONA (% vol),N-Parafinas"  -> "PIONA VOL N-PARAFINAS"
-        "PIONA(%vol),N-Parafinas"    -> "PIONA VOL N-PARAFINAS"
-        "Piona (%VOL) N-Parafinas"   -> "PIONA VOL N-PARAFINAS"
-        "Densidad a 15°C"            -> "DENSIDAD A 15C"
-        "Carbono Conradson"          -> "CARBONO CONRADSON"
-        "NOR Claro"                  -> "NOR CLARO"
-    """
+    """Normalización interna robusta: elimina acentos, paréntesis, %, /, comas y espacios extra."""
     if s is None:
         return ""
     t = strip_accents(str(s)).upper().strip()
-    # Eliminar caracteres de grado y punto (no son separadores de palabras)
     for ch in [".", "º", "°"]:
         t = t.replace(ch, "")
-    # Sustituir paréntesis y % por espacio (fuente principal de variantes en PIONA)
     for ch in ["(", ")", "%", "/"]:
         t = t.replace(ch, " ")
-    # Normalizar coma con o sin espacios -> espacio simple
     t = re.sub(r"\s*,\s*", " ", t)
-    # Colapsar espacios múltiples
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
 def canon_prop(s: str, alias: Optional[Dict[str, str]] = None) -> str:
-    """Canoniza nombres de propiedad y aplica alias.
-
-    Usa _canon_prop_norm internamente para tolerancia máxima a variantes:
-    paréntesis, porcentajes, comas, acentos, mayúsculas, grados.
-    """
+    """Canoniza nombres de propiedad y aplica alias."""
     t = _canon_prop_norm(s)
     if not re.search(r"[A-Z0-9]", t):
         return ""
@@ -122,7 +100,7 @@ def canon_prop(s: str, alias: Optional[Dict[str, str]] = None) -> str:
 
 
 def canon_corte(s: str) -> str:
-    """Canoniza etiquetas de corte."""
+    """Canoniza etiquetas de corte: normaliza guiones, grados, espacios."""
     if s is None:
         return ""
     t = str(s)
@@ -137,8 +115,13 @@ def canon_corte(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. Construcción de umbrales  (IDÉNTICA al MVP)
+# 2. Construcción de umbrales
+#    Tipo del dict: {(PROP_CANON, CORTE_CANON): (repro_or_None, admis_or_None)}
 # ---------------------------------------------------------------------------
+
+# Alias de tipo para mayor claridad
+UmbralesDict = Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]]
+
 
 def detectar_columna_tipo(df: pd.DataFrame) -> Optional[str]:
     for col in df.columns:
@@ -169,8 +152,16 @@ def normalizar_tipo(raw) -> str:
 def construir_umbrales(
     df: pd.DataFrame,
     alias_prop: Dict[str, str],
-) -> Dict[Tuple[str, str], float]:
-    """Devuelve dict {(PROP_CANON, CORTE_CANON): max(REPRO, ADMISIBLE)}."""
+) -> UmbralesDict:
+    """
+    Lee la matriz de umbrales y devuelve:
+        {(PROP_CANON, CORTE_CANON): (repro, admisible)}
+
+    - Filas con Tipo REPRO/REPET   → alimentan repro   (conserva el mayor)
+    - Filas con Tipo ADMISIBLE     → alimentan admisible (conserva el mayor)
+    - La propiedad se hereda hacia abajo: si la celda está vacía se usa
+      la última propiedad no vacía vista.
+    """
     col_prop = next((c for c in df.columns if str(c).strip().lower() == "propiedad"), None)
     if col_prop is None:
         raise ValueError("La matriz de umbrales no tiene columna 'Propiedad'.")
@@ -178,6 +169,7 @@ def construir_umbrales(
     if col_tipo is None:
         raise ValueError("No se localiza columna 'Tipo' en la matriz de umbrales.")
 
+    # Columnas de corte: todo lo que no sea Propiedad ni Tipo
     cortes_cols: List[Tuple[str, str]] = []
     for c in df.columns:
         if c in {col_prop, col_tipo}:
@@ -187,19 +179,26 @@ def construir_umbrales(
             continue
         cortes_cols.append((str(c), cc))
 
-    umbrales: Dict[Tuple[str, str], float] = {}
+    repro_dict: Dict[Tuple[str, str], float] = {}
+    admis_dict: Dict[Tuple[str, str], float] = {}
     prop_actual = ""
 
     for _, row in df.iterrows():
+        # Actualizar propiedad solo cuando la celda tiene contenido
         prop_raw = row.get(col_prop)
         prop_c = canon_prop(prop_raw, alias_prop)
         if prop_c:
             prop_actual = prop_c
         if not prop_actual:
             continue
+
         tipo = normalizar_tipo(row.get(col_tipo))
-        if not ("REPRO" in tipo or "ADMISIBLE" in tipo or "REPET" in tipo):
+        is_repro = "REPRO" in tipo or "REPET" in tipo
+        is_admis = "ADMISIBLE" in tipo
+
+        if not (is_repro or is_admis):
             continue
+
         for col_o, cc in cortes_cols:
             val = row.get(col_o)
             if pd.isna(val):
@@ -211,37 +210,24 @@ def construir_umbrales(
                 v = float(vs.replace(",", "."))
             except Exception:
                 continue
+
             key = (prop_actual, cc)
-            if key in umbrales:
-                if v > umbrales[key]:
-                    umbrales[key] = v
-            else:
-                umbrales[key] = v
-    return umbrales
+            if is_repro:
+                if key not in repro_dict or v > repro_dict[key]:
+                    repro_dict[key] = v
+            if is_admis:
+                if key not in admis_dict or v > admis_dict[key]:
+                    admis_dict[key] = v
+
+    all_keys = set(repro_dict) | set(admis_dict)
+    return {k: (repro_dict.get(k), admis_dict.get(k)) for k in all_keys}
 
 
 # ---------------------------------------------------------------------------
-# 3. Semántica de alias de propiedades  (IDÉNTICA al MVP)
+# 3. Semántica de alias de propiedades
 # ---------------------------------------------------------------------------
 
 def crear_semantica_alias() -> Dict[str, str]:
-    """
-    Devuelve diccionario de alias normalizados para nombres de propiedad.
-
-    Las claves y valores se generan con _canon_prop_norm, que es exactamente
-    la misma función que usa canon_prop al buscar. Esto garantiza que cualquier
-    variante que pase por canon_prop encuentre su alias, independientemente de
-    paréntesis, %, comas, espacios extras, acentos o capitalización.
-
-    Cobertura PIONA:
-        Cualquier combinación de:
-          - "PIONA (%vol), X"  /  "PIONA(%vol),X"  /  "PIONA (% vol) X"
-          - "PIONA X"          /  "PIONA, X"
-          - solo "X" (sin prefijo PIONA)
-        para X en: N-Parafinas, I-Parafinas, Naftenos, Polinaftenos,
-                   Aromaticos, Olefinas, Superiores a 200C
-    """
-    # Todas las claves en formato legible; _norm las normaliza automáticamente
     raw: Dict[str, str] = {
         # ── Peso ─────────────────────────────────────────────────────────────
         "PESO":                             "PESO",
@@ -251,7 +237,6 @@ def crear_semantica_alias() -> Dict[str, str]:
         "% DESTILADO":                      "PESO",
         "% VOL":                            "PESO",
         "% EN PESO":                        "PESO",
-
         # ── Densidad ─────────────────────────────────────────────────────────
         "DENSIDAD":                         "DENSIDAD",
         "DENSIDAD A 15C":                   "DENSIDAD",
@@ -262,7 +247,6 @@ def crear_semantica_alias() -> Dict[str, str]:
         "DENSIDAD A 15/4":                  "DENSIDAD",
         "D15":                              "DENSIDAD",
         "GRAVEDAD ESPECIFICA":              "DENSIDAD",
-
         # ── Viscosidad ───────────────────────────────────────────────────────
         "VISCOSIDAD 50":                    "VISCOSIDAD 50",
         "VISCOSIDAD 50C":                   "VISCOSIDAD 50",
@@ -278,13 +262,11 @@ def crear_semantica_alias() -> Dict[str, str]:
         "VISCOSIDAD CINEMATICA 100":        "VISCOSIDAD 100",
         "VISCOSIDAD CINEMATICA 100C":       "VISCOSIDAD 100",
         "VIS 100":                          "VISCOSIDAD 100",
-
         # ── Azufre ───────────────────────────────────────────────────────────
         "AZUFRE":                           "AZUFRE",
         "AZUFRE TOTAL":                     "AZUFRE",
         "AZUFRE MERCAPTANO":                "AZUFRE MERCAPTANO",
         "S MERCAPTANO":                     "AZUFRE MERCAPTANO",
-
         # ── Octanaje ─────────────────────────────────────────────────────────
         "RON":                              "RON",
         "NOR":                              "RON",
@@ -296,18 +278,15 @@ def crear_semantica_alias() -> Dict[str, str]:
         "NOM CLARO":                        "MON",
         "N O M CLARO":                      "MON",
         "NUMERO DE OCTANO MOTOR":           "MON",
-
         # ── Índice de neutralización ─────────────────────────────────────────
         "N DE NEUTRALIZACION":              "N DE NEUTRALIZACION",
         "NUMERO DE NEUTRALIZACION":         "N DE NEUTRALIZACION",
         "NO DE NEUTRALIZACION":             "N DE NEUTRALIZACION",
         "INDICE DE ACIDEZ":                 "N DE NEUTRALIZACION",
-
         # ── Índice de refracción ─────────────────────────────────────────────
         "INDICE DE REFRACCION 70C":         "INDICE DE REFRACCION 70C",
         "INDICE DE REFRACCION":             "INDICE DE REFRACCION 70C",
         "IR 70C":                           "INDICE DE REFRACCION 70C",
-
         # ── Puntos físicos ───────────────────────────────────────────────────
         "PUNTO DE VERTIDO":                 "PUNTO DE VERTIDO",
         "PUNTO DE NIEBLA":                  "PUNTO DE NIEBLA",
@@ -320,10 +299,7 @@ def crear_semantica_alias() -> Dict[str, str]:
         "PUNTO FINAL DE EBULLICION":        "PUNTO FINAL DE EBULLICION",
         "PFE":                              "PUNTO FINAL DE EBULLICION",
         "FBP":                              "PUNTO FINAL DE EBULLICION",
-
-        # ── PIONA — con prefijo "PIONA (%VOL)," (cualquier espaciado/coma) ──
-        # La normalización de _canon_prop_norm convierte "PIONA (%VOL), X"
-        # en "PIONA VOL X", igual que "PIONA (% vol),X" o "PIONA(%vol) X".
+        # ── PIONA ────────────────────────────────────────────────────────────
         "PIONA (%VOL), N-PARAFINAS":        "PIONA N-PARAFINAS",
         "PIONA (%VOL), I-PARAFINAS":        "PIONA I-PARAFINAS",
         "PIONA (%VOL), NAFTENOS":           "PIONA NAFTENOS",
@@ -331,15 +307,13 @@ def crear_semantica_alias() -> Dict[str, str]:
         "PIONA (%VOL), AROMATICOS":         "PIONA AROMATICOS",
         "PIONA (%VOL), OLEFINAS":           "PIONA OLEFINAS",
         "PIONA (%VOL), SUPERIORES A 200C":  "PIONA SUPERIORES A 200C",
-        "PIONA (%VOL) N-PARAFINAS":         "PIONA N-PARAFINAS",   # sin coma
+        "PIONA (%VOL) N-PARAFINAS":         "PIONA N-PARAFINAS",
         "PIONA (%VOL) I-PARAFINAS":         "PIONA I-PARAFINAS",
         "PIONA (%VOL) NAFTENOS":            "PIONA NAFTENOS",
         "PIONA (%VOL) POLINAFTENOS":        "PIONA POLINAFTENOS",
         "PIONA (%VOL) AROMATICOS":          "PIONA AROMATICOS",
         "PIONA (%VOL) OLEFINAS":            "PIONA OLEFINAS",
         "PIONA (%VOL) SUPERIORES A 200C":   "PIONA SUPERIORES A 200C",
-
-        # ── PIONA — con prefijo "PIONA," o "PIONA " ──────────────────────────
         "PIONA N-PARAFINAS":                "PIONA N-PARAFINAS",
         "PIONA I-PARAFINAS":                "PIONA I-PARAFINAS",
         "PIONA NAFTENOS":                   "PIONA NAFTENOS",
@@ -354,8 +328,6 @@ def crear_semantica_alias() -> Dict[str, str]:
         "PIONA, AROMATICOS":                "PIONA AROMATICOS",
         "PIONA, OLEFINAS":                  "PIONA OLEFINAS",
         "PIONA, SUPERIORES A 200C":         "PIONA SUPERIORES A 200C",
-
-        # ── PIONA — sin prefijo PIONA (solo el componente) ───────────────────
         "N-PARAFINAS":                      "PIONA N-PARAFINAS",
         "PARAFINAS NORMALES":               "PIONA N-PARAFINAS",
         "N PARAFINAS":                      "PIONA N-PARAFINAS",
@@ -369,26 +341,22 @@ def crear_semantica_alias() -> Dict[str, str]:
         "AROMATICS":                        "PIONA AROMATICOS",
         "OLEFINAS":                         "PIONA OLEFINAS",
         "SUPERIORES A 200C":                "PIONA SUPERIORES A 200C",
-
         # ── Nitrógeno ────────────────────────────────────────────────────────
         "NITROGENO":                        "NITROGENO",
         "NITROGENO TOTAL":                  "NITROGENO",
         "NITROGENO BASICO":                 "NITROGENO BASICO",
-
         # ── Residuo de carbono ───────────────────────────────────────────────
         "RESIDUO DE CARBON":                "RESIDUO DE CARBON",
         "CARBONO CONRADSON":                "RESIDUO DE CARBON",
         "CONRADSON":                        "RESIDUO DE CARBON",
         "CCR":                              "RESIDUO DE CARBON",
         "MCRT":                             "RESIDUO DE CARBON",
-
         # ── Asfaltenos y aromáticos ──────────────────────────────────────────
         "ASFALTENOS":                       "ASFALTENOS",
         "MONOAROMATICOS":                   "MONOAROMATICOS",
         "DIAROMATICOS":                     "DIAROMATICOS",
         "TRIAROMATICOS Y SUPERIORES":       "TRIAROMATICOS",
         "TRIAROMATICOS":                    "TRIAROMATICOS",
-
         # ── Gases ligeros ─────────────────────────────────────────────────────
         "CONTENIDO EN C2":                  "CONTENIDO EN C2",
         "C2":                               "CONTENIDO EN C2",
@@ -398,7 +366,6 @@ def crear_semantica_alias() -> Dict[str, str]:
         "IC4":                              "CONTENIDO EN IC4",
         "CONTENIDO EN NC4":                 "CONTENIDO EN NC4",
         "NC4":                              "CONTENIDO EN NC4",
-
         # ── Metales ──────────────────────────────────────────────────────────
         "NIQUEL":                           "NIQUEL",
         "NI":                               "NIQUEL",
@@ -407,9 +374,6 @@ def crear_semantica_alias() -> Dict[str, str]:
         "SILICIO":                          "SILICIO",
         "SI":                               "SILICIO",
     }
-
-    # Usar _canon_prop_norm (idéntica a la usada en canon_prop) para construir
-    # las claves del diccionario — garantiza match perfecto con lo que llegue
     out: Dict[str, str] = {}
     for k, v in raw.items():
         nk = _canon_prop_norm(k)
@@ -420,7 +384,7 @@ def crear_semantica_alias() -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Reglas de evaluación  (IDÉNTICAS al MVP)
+# 4. Reglas de evaluación
 # ---------------------------------------------------------------------------
 
 def es_corte_pesado(corte: str) -> bool:
@@ -446,46 +410,89 @@ def _prop_base_para_umbral(prop_canon: str) -> str:
     return prop_canon
 
 
+def _buscar_umbrales(
+    umbrales: UmbralesDict,
+    prop_canon: str,
+    corte_key: str,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Devuelve (repro, admis) para prop_canon × corte_key.
+    Aplica fallback PESO ACUMULADO → PESO.
+    """
+    par = umbrales.get((prop_canon, corte_key))
+    if par is not None:
+        return par
+    base_prop = _prop_base_para_umbral(prop_canon)
+    if base_prop != prop_canon:
+        par2 = umbrales.get((base_prop, corte_key))
+        if par2 is not None:
+            return par2
+    return (None, None)
+
+
 def _buscar_umbral(
-    umbrales: Dict[Tuple[str, str], float],
+    umbrales: UmbralesDict,
     prop_canon: str,
     corte_key: str,
 ) -> Optional[float]:
-    thr = umbrales.get((prop_canon, corte_key))
-    if thr is not None:
-        return thr
-    base_prop = _prop_base_para_umbral(prop_canon)
-    if base_prop != prop_canon:
-        thr2 = umbrales.get((base_prop, corte_key))
-        if thr2 is not None:
-            return thr2
-    return None
+    """
+    Wrapper de compatibilidad con tests: devuelve REPRO si existe, si no ADMISIBLE.
+    """
+    repro, admis = _buscar_umbrales(umbrales, prop_canon, corte_key)
+    return repro if repro is not None else admis
+
+
+def _clasificar_corte(
+    v: float,
+    repro: Optional[float],
+    admis: Optional[float],
+) -> str:
+    """
+    Clasifica el error de un corte individual.
+
+      repro y admis disponibles → verde / amarillo / rojo
+      solo repro                → verde / rojo
+      solo admis                → amarillo / rojo
+    """
+    if repro is not None and admis is not None:
+        if v < repro:
+            return "VERDE"
+        elif v < admis:
+            return "AMARILLO"
+        else:
+            return "ROJO"
+    elif repro is not None:
+        return "VERDE" if v < repro else "ROJO"
+    elif admis is not None:
+        return "AMARILLO" if v < admis else "ROJO"
+    return "(sin umbral)"
 
 
 def clasificar_propiedad(
-    errores_fila: Dict[str, float],
+    errores_fila: Dict[str, Optional[float]],
     prop_canon: str,
-    umbrales: Dict[Tuple[str, str], float],
-    tol: float,
+    umbrales: UmbralesDict,
     pct_ok_amarillo: float,
     pct_rojo_rojo: float,
-    tol_pesados: float = 0.6,
+    # tol / tol_pesados mantenidos por compatibilidad de firma, no se usan
+    tol: float = DEFAULT_TOL,
+    tol_pesados: float = DEFAULT_TOL_PESADOS,
 ) -> Tuple[str, Dict[str, str], Optional[str], Optional[float], float, Optional[float]]:
     """
     Clasifica una propiedad completa (todos sus cortes).
 
     Returns:
-        (semáforo_global, estados_por_corte, corte_peor, error_peor, ratio_peor, umbral_peor)
+        (semáforo_global, estados_por_corte, corte_peor, error_peor,
+         ratio_peor, umbral_repro_peor)
     """
     estados: Dict[str, str] = {}
     total_con_valor = 0
     total_valid = 0
     n_verde = n_amarillo = n_rojo = 0
-    rojo_absoluto = False
 
-    corte_peor = None
-    error_peor = None
-    umbral_peor = None
+    corte_peor: Optional[str] = None
+    error_peor: Optional[float] = None
+    umbral_peor: Optional[float] = None
     ratio_peor = -1.0
 
     base_prop = _prop_base_para_umbral(prop_canon)
@@ -495,7 +502,6 @@ def clasificar_propiedad(
         if valor is None or (isinstance(valor, float) and pd.isna(valor)):
             estados[corte] = "(no numérico)"
             continue
-
         try:
             v = float(str(valor).replace(",", "."))
         except Exception:
@@ -504,19 +510,34 @@ def clasificar_propiedad(
 
         total_con_valor += 1
 
+        # Buscar REPRO y ADMISIBLE para este corte
         cc = canon_corte(corte)
-        thr = _buscar_umbral(umbrales, prop_canon, cc)
-        if thr is None:
-            thr = _buscar_umbral(umbrales, prop_canon, corte)
+        repro, admis = _buscar_umbrales(umbrales, prop_canon, cc)
+        # Segundo intento sin canonizar (robustez ante cortes ya canonizados)
+        if repro is None and admis is None:
+            repro, admis = _buscar_umbrales(umbrales, prop_canon, corte)
 
-        if thr is None:
+        if repro is None and admis is None:
             estados[corte] = "(sin umbral)"
             continue
 
         total_valid += 1
 
+        estado = _clasificar_corte(v, repro, admis)
+        estados[corte] = estado
+
+        if estado == "VERDE":
+            n_verde += 1
+        elif estado == "AMARILLO":
+            n_amarillo += 1
+        else:
+            n_rojo += 1
+
+        # Corte peor: mayor ratio error / umbral_referencia
+        # Usamos repro como denominador preferente; si no existe, admis
+        denom = repro if (repro is not None and repro > 0) else (admis if admis and admis > 0 else None)
         try:
-            ratio = v / thr
+            ratio = v / denom if denom else float("inf")
         except ZeroDivisionError:
             ratio = float("inf")
 
@@ -524,62 +545,31 @@ def clasificar_propiedad(
             ratio_peor = ratio
             corte_peor = corte
             error_peor = v
-            umbral_peor = thr
+            # umbral_peor muestra REPRO preferentemente, sino ADMISIBLE
+            umbral_peor = repro if repro is not None else admis
 
-        if v > 3 * thr:
-            estados[corte] = "ROJO"
-            n_rojo += 1
-            rojo_absoluto = True
-            continue
-
-        if prop_canon in ("AZUFRE", "DENSIDAD", "DENSIDAD A 15C", "DENSIDAD A 15"):
-            if v <= 3 * thr:
-                estados[corte] = "VERDE"
-                n_verde += 1
-            elif 2 * thr < v <= 3 * thr:
-                estados[corte] = "AMARILLO"
-                n_amarillo += 1
-            else:
-                estados[corte] = "ROJO"
-                n_rojo += 1
-            continue
-
-        tol_local = tol_pesados if es_corte_pesado(corte) else tol
-        umbral_amarillo = thr * (1 + tol_local)
-
-        if v <= thr:
-            estados[corte] = "VERDE"
-            n_verde += 1
-        elif v <= umbral_amarillo:
-            estados[corte] = "AMARILLO"
-            n_amarillo += 1
-        else:
-            estados[corte] = "ROJO"
-            n_rojo += 1
-
-    # --- Semáforo global ---
+    # --- Semáforo global de la propiedad ---
     if total_con_valor == 0:
         return "", estados, corte_peor, error_peor, ratio_peor, umbral_peor
 
     if not tiene_umbral_prop or total_valid == 0:
         return "NA", estados, corte_peor, error_peor, ratio_peor, umbral_peor
 
-    if rojo_absoluto:
-        return "ROJO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-
     verde_pct = n_verde / total_valid
-    rojo_pct = n_rojo / total_valid
+    rojo_pct  = n_rojo  / total_valid
 
     if rojo_pct > pct_rojo_rojo:
-        return "ROJO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
-    if verde_pct >= pct_ok_amarillo:
-        return "VERDE", estados, corte_peor, error_peor, ratio_peor, umbral_peor
+        sem = "ROJO"
+    elif verde_pct >= pct_ok_amarillo:
+        sem = "VERDE"
+    else:
+        sem = "AMARILLO"
 
-    return "AMARILLO", estados, corte_peor, error_peor, ratio_peor, umbral_peor
+    return sem, estados, corte_peor, error_peor, ratio_peor, umbral_peor
 
 
 # ---------------------------------------------------------------------------
-# 5. Semáforo global por crudo  (IDÉNTICO al MVP)
+# 5. Semáforo global por crudo
 # ---------------------------------------------------------------------------
 
 def _sem_global_por_crudo(
@@ -597,12 +587,10 @@ def _sem_global_por_crudo(
             continue
         total = len(vals)
         verde = sum(1 for v in vals if v == "VERDE")
-        rojo = sum(1 for v in vals if v == "ROJO")
-        rojo_pct = rojo / total
-        verde_pct = verde / total
-        if rojo_pct > pct_rojo_rojo:
+        rojo  = sum(1 for v in vals if v == "ROJO")
+        if rojo / total > pct_rojo_rojo:
             out[cr] = "ROJO"
-        elif verde_pct >= pct_ok_amarillo:
+        elif verde / total >= pct_ok_amarillo:
             out[cr] = "VERDE"
         else:
             out[cr] = "AMARILLO"
@@ -610,7 +598,7 @@ def _sem_global_por_crudo(
 
 
 # ---------------------------------------------------------------------------
-# 6. Lectura de archivos  (en memoria, sin disco)
+# 6. Lectura de archivos (en memoria, sin disco)
 # ---------------------------------------------------------------------------
 
 def _get_extension(filename: str) -> str:
@@ -675,7 +663,6 @@ def read_file_with_sheet(
         try:
             return pd.read_excel(data, sheet_name=sheet, engine=engine)
         except Exception:
-            # fallback: intenta el otro engine
             data.seek(0)
             alt_engine = "xlrd" if engine == "openpyxl" else "openpyxl"
             try:
@@ -687,7 +674,7 @@ def read_file_with_sheet(
 
 
 # ---------------------------------------------------------------------------
-# 7. Detectar cortes en DataFrame  (IDÉNTICO al MVP)
+# 7. Detectar cortes en DataFrame
 # ---------------------------------------------------------------------------
 
 def detectar_cortes_en_df(df: pd.DataFrame) -> List[Tuple[str, str]]:
@@ -703,7 +690,7 @@ def detectar_cortes_en_df(df: pd.DataFrame) -> List[Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 8. Helpers de índices (IDÉNTICOS al MVP)
+# 8. Helpers de índices
 # ---------------------------------------------------------------------------
 
 def _indice_prop(df: pd.DataFrame, alias_prop: Dict[str, str]) -> Dict[str, int]:
@@ -740,14 +727,11 @@ def _float_or_none(x: Any) -> Optional[float]:
 
 
 def _nombre_base_crudo(fname: str) -> str:
-    """Extrae nombre de crudo del nombre de archivo (igual que el MVP)."""
-    # Quitar extensión
+    """Extrae nombre de crudo del nombre de archivo."""
     base = re.sub(r"\.[^.]+$", "", fname)
-    # Patrón estructurado tipo GMX-2023-1
     m = re.search(r"([A-Za-z]{3}-\d{4}-\d+)", base)
     if m:
         return m.group(1).upper()
-    # Fallback: eliminar prefijos/sufijos ISA/RAMS
     base = re.sub(r"^(?:ISA|RAMS)[_\-]+", "", base, flags=re.IGNORECASE)
     base = re.sub(r"([_\-])(ISA|RAMS)(?:([_\-]?v?\d{1,3})?)$", "", base, flags=re.IGNORECASE)
     base = re.sub(r"([_\-])(ISA|RAMS)(?:[_\-].*)?$", "", base, flags=re.IGNORECASE)
@@ -755,34 +739,18 @@ def _nombre_base_crudo(fname: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 9. Emparejamiento de archivos  (IDÉNTICO al MVP, adaptado a BytesIO)
+# 9. Emparejamiento de archivos
 # ---------------------------------------------------------------------------
 
 def pair_files(
     isa_names: List[str],
     rams_names: List[str],
 ) -> Tuple[Dict[str, Tuple[str, str]], List[str], List[str]]:
-    """
-    Empareja archivos ISA y RAMS por nombre base del crudo.
-    Devuelve (paired_map, unpaired_isa, unpaired_rams).
-    paired_map: {nombre_base: (isa_fname, rams_fname)}
-    """
-    isa_map: Dict[str, str] = {}
-    for n in isa_names:
-        base = _nombre_base_crudo(n)
-        isa_map[base] = n
+    isa_map:  Dict[str, str] = {_nombre_base_crudo(n): n for n in isa_names}
+    rams_map: Dict[str, str] = {_nombre_base_crudo(n): n for n in rams_names}
 
-    rams_map: Dict[str, str] = {}
-    for n in rams_names:
-        base = _nombre_base_crudo(n)
-        rams_map[base] = n
-
-    paired: Dict[str, Tuple[str, str]] = {}
-    for base, isa_fname in isa_map.items():
-        if base in rams_map:
-            paired[base] = (isa_fname, rams_map[base])
-
-    unpaired_isa = [isa_map[b] for b in isa_map if b not in rams_map]
+    paired = {base: (isa_map[base], rams_map[base]) for base in isa_map if base in rams_map}
+    unpaired_isa  = [isa_map[b]  for b in isa_map  if b not in rams_map]
     unpaired_rams = [rams_map[b] for b in rams_map if b not in isa_map]
 
     if unpaired_isa:
@@ -794,25 +762,26 @@ def pair_files(
 
 
 # ---------------------------------------------------------------------------
-# 10. Cálculo de errores por crudo  (IDÉNTICO al MVP)
+# 10. Cálculo de errores por crudo
 # ---------------------------------------------------------------------------
 
 def calcular_errores_crudo_df(
     df_isa: pd.DataFrame,
     df_rams: pd.DataFrame,
-    umbrales: Dict[Tuple[str, str], float],
+    umbrales: UmbralesDict,
     alias_prop: Dict[str, str],
-    tol: float,
     pct_ok_amarillo: float,
     pct_rojo_rojo: float,
-    tol_pesados: float,
     hoja_resumen: Dict[str, Dict[str, str]],
     crude_name: str,
+    tol: float = DEFAULT_TOL,
+    tol_pesados: float = DEFAULT_TOL_PESADOS,
 ) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
-    Calcula errores y semáforos para un par ISA/RAMS.
+    Calcula errores absolutos |ISA − RAMS| y semáforos para un par de archivos.
+
     Devuelve (df_out, columnas_cortes_visibles, orden_props_local).
-    df_out tiene columnas: Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor | [cortes...]
+    df_out: Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor | [cortes...]
     """
     if "Propiedad" not in df_isa.columns:
         raise ValueError("El archivo ISA no tiene columna 'Propiedad'.")
@@ -823,7 +792,7 @@ def calcular_errores_crudo_df(
     if not cortes_isa:
         raise ValueError("El archivo ISA no contiene cortes reconocibles.")
 
-    idx_rams = _indice_prop(df_rams, alias_prop)
+    idx_rams        = _indice_prop(df_rams, alias_prop)
     cortes_map_rams = _mapa_cortes(df_rams)
 
     columnas_cortes_visibles = [cname for (cname, _cc) in cortes_isa]
@@ -835,7 +804,7 @@ def calcular_errores_crudo_df(
     orden_props_local: List[str] = []
 
     for _, row_isa in df_isa.iterrows():
-        prop_raw = row_isa.get("Propiedad")
+        prop_raw   = row_isa.get("Propiedad")
         prop_canon = canon_prop(prop_raw, alias_prop)
         if not prop_canon:
             continue
@@ -847,48 +816,49 @@ def calcular_errores_crudo_df(
 
         row_rams = df_rams.iloc[idx_rams[prop_canon]]
 
-        errores_fila: Dict[str, float] = {}
+        # Calcular error absoluto |ISA − RAMS| por corte
+        errores_fila: Dict[str, Optional[float]] = {}
         fila_out: Dict[str, Any] = {"Propiedad": str(prop_raw)}
 
         for (cname_isa, cc_isa) in cortes_isa:
             col_rams = cortes_map_rams.get(cc_isa)
             if col_rams is None:
-                fila_out[cname_isa] = None
+                fila_out[cname_isa]   = None
+                errores_fila[cc_isa] = None
                 continue
-            isa_val = _float_or_none(row_isa.get(cname_isa))
-            rams_val = _float_or_none(row_rams.get(col_rams))
-            if isa_val is None or rams_val is None:
-                err = None
-            else:
-                err = abs(isa_val - rams_val)
-            errores_fila[cc_isa] = err
-            fila_out[cname_isa] = err
 
+            isa_val  = _float_or_none(row_isa.get(cname_isa))
+            rams_val = _float_or_none(row_rams.get(col_rams))
+
+            err = abs(isa_val - rams_val) if (isa_val is not None and rams_val is not None) else None
+
+            errores_fila[cc_isa] = err
+            fila_out[cname_isa]  = err
+
+        # Clasificar
         sem, _estados, corte_peor, error_peor, _ratio, umbral_peor = clasificar_propiedad(
             errores_fila,
             prop_canon,
             umbrales,
-            tol=tol,
             pct_ok_amarillo=pct_ok_amarillo,
             pct_rojo_rojo=pct_rojo_rojo,
+            tol=tol,
             tol_pesados=tol_pesados,
         )
 
-        fila_out["Semaforo"] = sem
-        fila_out["Corte_peor"] = corte_peor
-        fila_out["Error_peor"] = error_peor
+        fila_out["Semaforo"]    = sem
+        fila_out["Corte_peor"]  = corte_peor
+        fila_out["Error_peor"]  = error_peor
         fila_out["Umbral_peor"] = umbral_peor
 
-        # Resumen global (propiedad × crudo)
         hoja_resumen.setdefault(prop_canon, {})[crude_name] = sem
-
         df_out.loc[len(df_out)] = fila_out
 
     return df_out, columnas_cortes_visibles, orden_props_local
 
 
 # ---------------------------------------------------------------------------
-# 11. Validación de configuración  (IDÉNTICA al MVP, adaptada a runtime)
+# 11. Validación de parámetros
 # ---------------------------------------------------------------------------
 
 def validate_params(
@@ -897,7 +867,6 @@ def validate_params(
     pct_ok_amarillo: float,
     pct_rojo_rojo: float,
 ) -> None:
-    """Valida parámetros del pipeline. Lanza ValueError si son incoherentes."""
     for name, v in [("tolerancia", tol), ("tol_pesados", tol_pesados)]:
         if v < 0:
             raise ValueError(f"'{name}' no puede ser negativo (recibido: {v}).")
@@ -907,7 +876,7 @@ def validate_params(
 
 
 # ---------------------------------------------------------------------------
-# 12. Pipeline completo  (equivalente a run_validation_in_memory del MVP)
+# 12. Pipeline completo
 # ---------------------------------------------------------------------------
 
 def run_validation(
@@ -921,32 +890,14 @@ def run_validation(
     pct_rojo_rojo: float = DEFAULT_PCT_ROJO_ROJO,
     sheet_hint: Optional[str] = None,
 ) -> ValidationResult:
-    """
-    Pipeline completo: lee umbrales → empareja → calcula → construye ValidationResult.
-
-    Args:
-        isa_files:         Mapa nombre → BytesIO de archivos ISA.
-        rams_files:        Mapa nombre → BytesIO de archivos RAMS.
-        matriz_file:       Archivo de la matriz de umbrales (BytesIO).
-        matriz_filename:   Nombre del archivo de matriz (para detectar extensión).
-        tol:               Tolerancia estándar (default 0.10).
-        tol_pesados:       Tolerancia cortes pesados (default 0.60).
-        pct_ok_amarillo:   % mínimo verdes para VERDE global (default 0.90).
-        pct_rojo_rojo:     % máximo rojos para ROJO global (default 0.30).
-        sheet_hint:        Nombre o índice de hoja en la matriz (None = primera).
-
-    Returns:
-        ValidationResult completo listo para UI y exportación.
-    """
+    """Pipeline completo: lee umbrales → empareja → calcula → construye ValidationResult."""
     validate_params(tol, tol_pesados, pct_ok_amarillo, pct_rojo_rojo)
 
-    # Leer matriz de umbrales
     alias_prop = crear_semantica_alias()
-    df_matriz = read_file_with_sheet(matriz_file, matriz_filename, sheet_hint)
-    umbrales = construir_umbrales(df_matriz, alias_prop)
-    logger.info("Umbrales cargados: %d claves", len(umbrales))
+    df_matriz  = read_file_with_sheet(matriz_file, matriz_filename, sheet_hint)
+    umbrales   = construir_umbrales(df_matriz, alias_prop)
+    logger.info("Umbrales cargados: %d claves (prop × corte)", len(umbrales))
 
-    # Emparejar
     paired_map, unpaired_isa, unpaired_rams = pair_files(
         list(isa_files.keys()), list(rams_files.keys())
     )
@@ -958,11 +909,10 @@ def run_validation(
     for crude_name, (isa_fname, rams_fname) in sorted(paired_map.items()):
         try:
             logger.info("Procesando crudo: %s", crude_name)
-            # Rewind before reading (streams can only be read once)
             isa_files[isa_fname].seek(0)
             rams_files[rams_fname].seek(0)
 
-            df_isa = read_file(isa_files[isa_fname], isa_fname)
+            df_isa  = read_file(isa_files[isa_fname],  isa_fname)
             df_rams = read_file(rams_files[rams_fname], rams_fname)
 
             df_out, cortes_visibles, orden_local = calcular_errores_crudo_df(
@@ -970,17 +920,17 @@ def run_validation(
                 df_rams=df_rams,
                 umbrales=umbrales,
                 alias_prop=alias_prop,
-                tol=tol,
                 pct_ok_amarillo=pct_ok_amarillo,
                 pct_rojo_rojo=pct_rojo_rojo,
-                tol_pesados=tol_pesados,
                 hoja_resumen=resumen,
                 crude_name=crude_name,
+                tol=tol,
+                tol_pesados=tol_pesados,
             )
 
             result.paired_names.append(crude_name)
             result.crudo_dataframes[crude_name] = df_out
-            result.cortes_visibles[crude_name] = cortes_visibles
+            result.cortes_visibles[crude_name]  = cortes_visibles
 
             if not orden_propiedades:
                 orden_propiedades = orden_local
@@ -989,17 +939,17 @@ def run_validation(
             logger.error("Error procesando '%s': %s", crude_name, e)
             result.unpaired_isa.append(f"{isa_fname} [ERROR: {e}]")
 
-    result.resumen_raw = resumen
+    result.resumen_raw       = resumen
     result.orden_propiedades = orden_propiedades
-    result.pct_ok_amarillo = pct_ok_amarillo
-    result.pct_rojo_rojo = pct_rojo_rojo
+    result.pct_ok_amarillo   = pct_ok_amarillo
+    result.pct_rojo_rojo     = pct_rojo_rojo
     result.summary = _build_summary_df(resumen, orden_propiedades, pct_ok_amarillo, pct_rojo_rojo)
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# 13. Construcción del DataFrame resumen (igual estructura que el MVP)
+# 13. DataFrame resumen
 # ---------------------------------------------------------------------------
 
 def _build_summary_df(
@@ -1008,11 +958,7 @@ def _build_summary_df(
     pct_ok_amarillo: float,
     pct_rojo_rojo: float,
 ) -> pd.DataFrame:
-    """
-    Construye DataFrame resumen (Propiedad × crudos) con fila GLOBAL al inicio.
-    Idéntico a la hoja Resumen del MVP.
-    """
-    todos_crudos = sorted({c for m in resumen.values() for c in m.keys()})
+    todos_crudos     = sorted({c for m in resumen.values() for c in m.keys()})
     global_por_crudo = _sem_global_por_crudo(resumen, pct_ok_amarillo, pct_rojo_rojo)
 
     data = []
@@ -1029,59 +975,41 @@ def _build_summary_df(
                 row[cr] = resumen[prop].get(cr, "")
             data.append(row)
 
-    if data:
-        return pd.DataFrame(data)
-    return pd.DataFrame(columns=["Propiedad"])
+    return pd.DataFrame(data) if data else pd.DataFrame(columns=["Propiedad"])
 
 
 # ---------------------------------------------------------------------------
-# 14. Exportación a Excel  (IDÉNTICA al MVP en estructura y colores)
+# 14. Exportación a Excel
 # ---------------------------------------------------------------------------
 
 def add_conditional_formatting_text(ws, cell_range: str) -> None:
-    """Formato condicional por texto exacto (igual al MVP)."""
-    fill_verde = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    fill_amar  = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-    fill_rojo  = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    fill_gris  = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-
-    dxf_v = DifferentialStyle(fill=fill_verde)
-    dxf_a = DifferentialStyle(fill=fill_amar)
-    dxf_r = DifferentialStyle(fill=fill_rojo)
-    dxf_g = DifferentialStyle(fill=fill_gris)
-
-    rule_v = Rule(type="containsText", operator="containsText", text="VERDE",    dxf=dxf_v)
-    rule_a = Rule(type="containsText", operator="containsText", text="AMARILLO", dxf=dxf_a)
-    rule_r = Rule(type="containsText", operator="containsText", text="ROJO",     dxf=dxf_r)
-    rule_n = Rule(type="containsText", operator="containsText", text="NA",       dxf=dxf_g)
-
-    ws.conditional_formatting.add(cell_range, rule_v)
-    ws.conditional_formatting.add(cell_range, rule_a)
-    ws.conditional_formatting.add(cell_range, rule_r)
-    ws.conditional_formatting.add(cell_range, rule_n)
+    colors = {
+        "VERDE":    "C6EFCE",
+        "AMARILLO": "FFEB9C",
+        "ROJO":     "FFC7CE",
+        "NA":       "E7E6E6",
+    }
+    for text, color in colors.items():
+        fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+        ws.conditional_formatting.add(
+            cell_range,
+            Rule(type="containsText", operator="containsText", text=text,
+                 dxf=DifferentialStyle(fill=fill))
+        )
 
 
 def _escribir_hoja_df(ws, df: pd.DataFrame) -> None:
-    """Escribe DataFrame en hoja openpyxl con cabecera en negrita y autoajuste."""
     for r in dataframe_to_rows(df, index=False, header=True):
         ws.append(r)
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for col in ws.columns:
-        max_len = max(
-            (len(str(cell.value)) if cell.value is not None else 0) for cell in col
-        )
+        max_len = max((len(str(cell.value)) if cell.value is not None else 0) for cell in col)
         ws.column_dimensions[col[0].column_letter].width = min(max(10, max_len + 2), 45)
 
 
 def build_excel(result: ValidationResult) -> bytes:
-    """
-    Genera el Excel de resultados con estructura idéntica al MVP:
-      - Hoja 'Resumen': Propiedad × crudos, fila GLOBAL al inicio, formato condicional
-      - Una hoja por crudo: Propiedad | Semaforo | Corte_peor | Error_peor | Umbral_peor | [cortes...]
-        Formato condicional solo en columna Semaforo (B).
-    """
-    wb = Workbook()
+    wb  = Workbook()
     ws0 = wb.active
     ws0.title = "Resumen"
 
@@ -1090,17 +1018,13 @@ def build_excel(result: ValidationResult) -> bytes:
 
     todos_crudos = [c for c in df_res.columns if c != "Propiedad"]
     if df_res.shape[0] > 0 and todos_crudos:
-        start_row = 2
         end_row = df_res.shape[0] + 1
         for j in range(2, 2 + len(todos_crudos)):
-            col_letter = get_column_letter(j)
-            add_conditional_formatting_text(ws0, f"{col_letter}{start_row}:{col_letter}{end_row}")
+            add_conditional_formatting_text(ws0, f"{get_column_letter(j)}2:{get_column_letter(j)}{end_row}")
 
-    # Hojas por crudo
     for crude_name in result.paired_names:
         df_out = result.crudo_dataframes.get(crude_name, pd.DataFrame())
-        hoja = crude_name[:31]
-        ws = wb.create_sheet(title=hoja)
+        ws = wb.create_sheet(title=crude_name[:31])
         _escribir_hoja_df(ws, df_out)
         if df_out.shape[0] > 0:
             add_conditional_formatting_text(ws, f"B2:B{df_out.shape[0] + 1}")
@@ -1112,17 +1036,13 @@ def build_excel(result: ValidationResult) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compat stubs (usados en tests existentes y referencias externas)
-# Estos permiten que los tests del core anterior sigan pasando mientras se
-# migra incrementalmente.
+# Backwards-compat stubs
 # ---------------------------------------------------------------------------
 
 def canonize_name(name: str) -> str:
-    """Alias de _nombre_base_crudo para compatibilidad con tests existentes."""
     return _nombre_base_crudo(name)
 
 
-# ThresholdConfig-based interface (para compatibilidad con los tests antiguos)
 def validate_thresholds(config: "ThresholdConfig") -> None:
     if not (0 <= config.default_green < config.default_yellow):
         raise ValueError(
